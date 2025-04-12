@@ -180,7 +180,7 @@ members = [
     "unified-scheduler-pool",
     "upload-perf",
     "validator",
-    "version",
+    "version", "vhook_tester",
     "vote",
     "watchtower",
     "wen-restart",

@@ -107,9 +107,6 @@ tokio = { workspace = true, features = ["full"] }
 tonic = { workspace = true }
 trees = { workspace = true }
 
-# hook
-laminar = { version = "0.5.0", features = ["env_logger"] }
-
 [dev-dependencies]
 assert_matches = { workspace = true }
 fs_extra = { workspace = true }

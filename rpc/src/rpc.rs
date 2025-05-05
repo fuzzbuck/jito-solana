@@ -3515,8 +3515,8 @@ pub mod utils {
         std::str::FromStr,
     };
 
-    fn bundle_error_to_rpc_error(
-        bundle_execution_error: BundleExecutionError,
+    pub fn bundle_error_to_rpc_error(
+        bundle_execution_error: &BundleExecutionError,
     ) -> RpcBundleExecutionError {
         match bundle_execution_error {
             BundleExecutionError::BankProcessingTimeLimitReached => {
@@ -3532,17 +3532,17 @@ pub mod utils {
                         signature,
                         transaction_error,
                     } => RpcBundleExecutionError::TransactionFailure(
-                        signature,
+                        *signature,
                         transaction_error.to_string(),
                     ),
                     LoadAndExecuteBundleError::TransactionError {
                         signature,
                         execution_result,
-                    } => match *execution_result {
+                    } => match execution_result.as_ref() {
                         Ok(processed_transaction) => {
                             match processed_transaction.executed_transaction() {
                                 None => RpcBundleExecutionError::TransactionFailure(
-                                    signature,
+                                    *signature,
                                     processed_transaction.status().unwrap_err().to_string(),
                                 ),
                                 Some(tx) => {
@@ -3551,12 +3551,12 @@ pub mod utils {
                                     } else {
                                         "Unknown error".to_string()
                                     };
-                                    RpcBundleExecutionError::TransactionFailure(signature, err_msg)
+                                    RpcBundleExecutionError::TransactionFailure(*signature, err_msg)
                                 }
                             }
                         }
                         Err(e) => {
-                            RpcBundleExecutionError::TransactionFailure(signature, e.to_string())
+                            RpcBundleExecutionError::TransactionFailure(*signature, e.to_string())
                         }
                     },
                     LoadAndExecuteBundleError::InvalidPreOrPostAccounts => {
@@ -3605,7 +3605,7 @@ pub mod utils {
                     _ => None,
                 };
                 RpcBundleSimulationSummary::Failed {
-                    error: bundle_error_to_rpc_error(BundleExecutionError::TransactionFailure(
+                    error: bundle_error_to_rpc_error(&BundleExecutionError::TransactionFailure(
                         e.clone(),
                     )),
                     tx_signature,

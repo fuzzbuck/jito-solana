@@ -187,6 +187,7 @@ members = [
     "zk-keygen",
     "zk-sdk",
     "zk-token-sdk",
+    "mprotos"
 ]
 
 exclude = [
@@ -546,6 +547,7 @@ solana-zk-keygen = { path = "zk-keygen", version = "=2.1.16" }
 solana-zk-sdk = { path = "zk-sdk", version = "=2.1.16" }
 solana-zk-token-proof-program = { path = "programs/zk-token-proof", version = "=2.1.16" }
 solana-zk-token-sdk = { path = "zk-token-sdk", version = "=2.1.16" }
+mev-relayer-protos = { path = "mprotos" }
 solana_rbpf = "=0.8.5"
 spl-associated-token-account = "=4.0.0"
 spl-instruction-padding = "0.2"
@@ -572,13 +574,13 @@ test-case = "3.3.1"
 thiserror = "1.0.65"
 tiny-bip39 = "0.8.2"
 # Update solana-tokio patch below when updating this version
-tokio = "1.43.0"
+tokio = { version = "1.43.0", features = ["full"] }
 tokio-serde = "0.8"
 tokio-stream = "0.1.16"
 tokio-tungstenite = "0.20.1"
 tokio-util = "0.7"
 toml = "0.8.12"
-tonic = "0.9.2"
+tonic = { version = "0.9.2", features = ["gzip"] }
 tonic-build = "0.9.2"
 trees = "0.4.2"
 tungstenite = "0.20.1"

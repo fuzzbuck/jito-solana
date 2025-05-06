@@ -186,8 +186,7 @@ members = [
     "wen-restart",
     "zk-keygen",
     "zk-sdk",
-    "zk-token-sdk",
-    "mprotos"
+    "zk-token-sdk"
 ]
 
 exclude = [
@@ -361,9 +360,9 @@ pretty-hex = "0.3.0"
 prio-graph = "0.3.0"
 proc-macro2 = "1.0.89"
 proptest = "1.5"
-prost = "0.11.9"
-prost-build = "0.11.9"
-prost-types = "0.11.9"
+prost = "=0.12.1"
+prost-build = "=0.12.1"
+prost-types = "=0.12.1"
 protobuf-src = "1.1.0"
 qstring = "0.7.2"
 qualifier_attr = { version = "0.2.2", default-features = false }
@@ -547,7 +546,7 @@ solana-zk-keygen = { path = "zk-keygen", version = "=2.1.21" }
 solana-zk-sdk = { path = "zk-sdk", version = "=2.1.21" }
 solana-zk-token-proof-program = { path = "programs/zk-token-proof", version = "=2.1.21" }
 solana-zk-token-sdk = { path = "zk-token-sdk", version = "=2.1.21" }
-mev-relayer-protos = { path = "mprotos" }
+mev-relayer-protos = { git = "https://github.com/fuzzbuck/mprotos.git", rev = "4519b9d095ab343f70f73ac87e751c2a0b67a428"}
 solana_rbpf = "=0.8.5"
 spl-associated-token-account = "=4.0.0"
 spl-instruction-padding = "0.2"
@@ -580,8 +579,8 @@ tokio-stream = "0.1.16"
 tokio-tungstenite = "0.20.1"
 tokio-util = "0.7"
 toml = "0.8.12"
-tonic = { version = "0.9.2", features = ["gzip"] }
-tonic-build = "0.9.2"
+tonic = { version = "=0.10.2"}
+tonic-build = "=0.10.2"
 trees = "0.4.2"
 tungstenite = "0.20.1"
 uriparse = "0.6.4"

@@ -90,6 +90,7 @@ use {
         time::{Duration, Instant},
     },
 };
+use solana_vote_program::vote_state::VoteState;
 
 pub const MAX_ENTRY_RECV_PER_ITER: usize = 512;
 pub const SUPERMINORITY_THRESHOLD: f64 = 1f64 / 3f64;

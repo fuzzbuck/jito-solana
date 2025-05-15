@@ -422,7 +422,7 @@ pub mod test {
         let loaded = Tower::restore(&tower_storage, &node_pubkey).unwrap();
         assert_eq!(loaded.node_pubkey, old_tower.node_pubkey);
         assert_eq!(loaded.last_vote(), VoteTransaction::from(vote));
-        assert_eq!(loaded.vote_state.root_slot, Some(1));
+        assert_eq!(loaded.lockout_state.root_slot, Some(1));
         assert_eq!(loaded.stray_restored_slot(), None);
     }
 }

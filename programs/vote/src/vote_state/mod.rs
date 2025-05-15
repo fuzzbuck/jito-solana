@@ -1,6 +1,7 @@
 //! Vote state, vote program
 //! Receive and processes votes from validators
-pub use solana_program::vote::state::{vote_state_versions::*, *};
+pub use solana_vote_interface::state::{*, vote_state_versions::*};
+
 use {
     agave_feature_set::{self as feature_set, FeatureSet},
     log::*,
@@ -16,6 +17,7 @@ use {
     solana_transaction_context::{
         BorrowedAccount, IndexOfAccount, InstructionContext, TransactionContext,
     },
+    solana_vote_interface::{error::VoteError, program::id},
     std::{
         cmp::Ordering,
         collections::{HashSet, VecDeque},
@@ -739,7 +741,6 @@ pub fn process_vote_unfiltered(
             *s,
             epoch,
             current_slot,
-            timely_vote_credits,
             pop_expired,
         )
     });

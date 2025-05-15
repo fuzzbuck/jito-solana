@@ -1,5 +1,3 @@
-use crate::replay_stage::DUPLICATE_THRESHOLD;
-
 pub mod fork_choice;
 pub mod heaviest_subtree_fork_choice;
 pub(crate) mod latest_validator_votes_for_frozen_banks;
@@ -58,6 +56,7 @@ use {
     },
     thiserror::Error,
 };
+use solana_vote_program::vote_state::process_vote_unchecked;
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug, Default)]
 pub enum ThresholdDecision {
@@ -242,15 +241,10 @@ pub struct Tower {
     // bank_forks (=~ ledger) lacks the slot or not.
     stray_restored_slot: Option<Slot>,
     pub last_switch_threshold_check: Option<(Slot, SwitchForkDecision)>,
-    #[serde(skip)]
     mostly_confirmed_threshold: Option<f64>,
-    #[serde(skip)]
     threshold_ahead_count: Option<u8>,
-    #[serde(skip)]
     after_skip_threshold: Option<u8>,
-    #[serde(skip)]
     threshold_escape_count: Option<u8>,
-    #[serde(skip)]
     last_config_check_seconds: u64,
 }
 
@@ -310,6 +304,11 @@ impl From<Tower1_14_11> for Tower {
             last_timestamp: tower.last_timestamp,
             stray_restored_slot: tower.stray_restored_slot,
             last_switch_threshold_check: tower.last_switch_threshold_check,
+            mostly_confirmed_threshold: None,
+            threshold_ahead_count: None,
+            after_skip_threshold: None,
+            threshold_escape_count: None,
+            last_config_check_seconds: 0,
         }
     }
 }
@@ -328,6 +327,11 @@ impl From<Tower1_7_14> for Tower {
             last_timestamp: tower.last_timestamp,
             stray_restored_slot: tower.stray_restored_slot,
             last_switch_threshold_check: tower.last_switch_threshold_check,
+            mostly_confirmed_threshold: None,
+            threshold_ahead_count: None,
+            after_skip_threshold: None,
+            threshold_escape_count: None,
+            last_config_check_seconds: 0,
         }
     }
 }
@@ -839,20 +843,21 @@ impl Tower {
         block_id: Hash,
         pop_expired: bool,
     ) -> Option<Slot> {
+        if let Some(last_voted_slot) = self.vote_state.last_voted_slot() {
+            if vote_slot <= last_voted_slot {
+                panic!(
+                    "Error while recording vote {} {} in local tower {:?}",
+                    vote_slot,
+                    vote_hash,
+                    VoteError::VoteTooOld
+                );
+            }
+        }
+
         trace!("{} record_vote for {}", self.node_pubkey, vote_slot);
         let old_root = self.root();
 
-        let vote = Vote::new(vec![vote_slot], vote_hash);
-        let result = process_vote_unchecked(&mut self.vote_state, vote, pop_expired);
-        if result.is_err() {
-            panic!(
-                "Error while recording vote {} {} in local tower {:?}",
-                vote_slot, vote_hash, result
-            );
-        }
-
-        // TODO maybe uncomment this
-        // self.vote_state.process_next_vote_slot(vote_slot);
+        self.vote_state.process_next_vote_slot(vote_slot);
         self.update_last_vote_from_vote_state(vote_hash, enable_tower_sync_ix, block_id);
 
         let new_root = self.root();
@@ -1008,10 +1013,10 @@ impl Tower {
         let mut vote_state = self.vote_state.clone();
 
         for slot in including {
-            process_slot_vote_unchecked(&mut vote_state, *slot);
+            vote_state.process_next_vote_slot(*slot);
         }
+        vote_state.process_next_vote_slot(slot);
 
-        process_slot_vote_unchecked(&mut vote_state, slot);
         for vote in &vote_state.votes {
             if slot != vote.slot() && !ancestors.contains(&vote.slot()) {
                 return true;
@@ -1036,7 +1041,7 @@ impl Tower {
         let mut vote_state = self.vote_state.clone();
 
         for i in 0..new_votes.len() {
-            process_slot_vote_unchecked(&mut vote_state, new_votes[i]);
+            vote_state.process_next_vote_slot(new_votes[i]);
             if let Some(last_lockout) = vote_state.last_lockout() {
                 if last_lockout.is_locked_out_at_slot(slot) {
                     // New votes cannot include this or any subsequent slots

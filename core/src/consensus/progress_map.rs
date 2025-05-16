@@ -188,6 +188,7 @@ pub struct ForkStats {
     pub voted_stakes: VotedStakes,
     pub duplicate_confirmed_hash: Option<Hash>,
     pub computed: bool,
+    pub is_mostly_confirmed: bool,
     pub lockout_intervals: LockoutIntervals,
     pub bank_hash: Option<Hash>,
     pub my_latest_landed_vote: Option<Slot>,

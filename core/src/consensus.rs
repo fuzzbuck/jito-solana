@@ -9,6 +9,7 @@ pub(crate) mod tower_vote_state;
 pub mod tree_diff;
 pub mod vote_stake_tracker;
 
+use std::path::{Path, PathBuf};
 use {
     self::{
         heaviest_subtree_fork_choice::HeaviestSubtreeForkChoice,
@@ -215,6 +216,41 @@ pub(crate) enum BlockhashStatus {
     Blockhash(Hash),
 }
 
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct VoteOptimizationConfig {
+    mostly_confirmed_threshold: f64,
+    pub threshold_ahead_count: usize,
+    pub after_skip_threshold: usize,
+    pub threshold_escape_count: usize,
+
+    #[serde(default)]
+    last_reload: i64,
+}
+
+impl VoteOptimizationConfig {
+    pub fn load_from_yaml_file(path: &str) -> Result<Self> {
+        let contents = std::fs::read_to_string(path)
+            .map_err(|e| TowerError::IoError(e))?;
+
+        let config: Self = serde_yaml::from_str(&contents)
+            .map_err(|e| TowerError::FatallyInconsistent("failed to parse yaml of type VoteOptimizationConfig"))?;
+
+        Ok(config)
+    }
+}
+
+impl Default for VoteOptimizationConfig {
+    fn default() -> Self {
+        Self {
+            mostly_confirmed_threshold: 0.45,
+            threshold_ahead_count: 4,
+            after_skip_threshold: 0,
+            threshold_escape_count: 24,
+            last_reload: 0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tower {
     pub node_pubkey: Pubkey,
@@ -237,6 +273,7 @@ pub struct Tower {
     // bank_forks (=~ ledger) lacks the slot or not.
     stray_restored_slot: Option<Slot>,
     pub last_switch_threshold_check: Option<(Slot, SwitchForkDecision)>,
+    pub vo_config: VoteOptimizationConfig,
 }
 
 impl Default for Tower {
@@ -251,6 +288,7 @@ impl Default for Tower {
             last_vote_tx_blockhash: BlockhashStatus::default(),
             stray_restored_slot: Option::default(),
             last_switch_threshold_check: Option::default(),
+            vo_config: VoteOptimizationConfig::default(),
         };
         // VoteState::root_slot is ensured to be Some in Tower
         tower.vote_state.root_slot = Some(Slot::default());
@@ -290,6 +328,7 @@ impl From<Tower1_14_11> for Tower {
             last_timestamp: tower.last_timestamp,
             stray_restored_slot: tower.stray_restored_slot,
             last_switch_threshold_check: tower.last_switch_threshold_check,
+            vo_config: Default::default(),
         }
     }
 }
@@ -308,6 +347,7 @@ impl From<Tower1_7_14> for Tower {
             last_timestamp: tower.last_timestamp,
             stray_restored_slot: tower.stray_restored_slot,
             last_switch_threshold_check: tower.last_switch_threshold_check,
+            vo_config: Default::default(),
         }
     }
 }
@@ -612,7 +652,7 @@ impl Tower {
         vote_state.last_voted_slot()
     }
 
-    pub fn record_bank_vote(&mut self, bank: &Bank) -> Option<Slot> {
+    pub fn record_bank_vote(&mut self, bank: &Bank, pop_expired: bool) -> Option<Slot> {
         // Returns the new root if one is made after applying a vote for the given bank to
         // `self.vote_state`
         let block_id = bank.block_id().unwrap_or_else(|| {
@@ -628,6 +668,7 @@ impl Tower {
             bank.feature_set
                 .is_active(&agave_feature_set::enable_tower_sync_ix::id()),
             block_id,
+            pop_expired
         )
     }
 
@@ -664,6 +705,7 @@ impl Tower {
         vote_hash: Hash,
         enable_tower_sync_ix: bool,
         block_id: Hash,
+        pop_expired: bool
     ) -> Option<Slot> {
         if let Some(last_voted_slot) = self.vote_state.last_voted_slot() {
             if vote_slot <= last_voted_slot {
@@ -679,7 +721,7 @@ impl Tower {
         trace!("{} record_vote for {}", self.node_pubkey, vote_slot);
         let old_root = self.root();
 
-        self.vote_state.process_next_vote_slot(vote_slot);
+        self.vote_state.process_next_vote_slot(vote_slot, pop_expired);
         self.update_last_vote_from_vote_state(vote_hash, enable_tower_sync_ix, block_id);
 
         let new_root = self.root();
@@ -698,7 +740,7 @@ impl Tower {
 
     #[cfg(feature = "dev-context-only-utils")]
     pub fn record_vote(&mut self, slot: Slot, hash: Hash) -> Option<Slot> {
-        self.record_bank_vote_and_update_lockouts(slot, hash, true, Hash::default())
+        self.record_bank_vote_and_update_lockouts(slot, hash, true, Hash::default(), true)
     }
 
     #[cfg(feature = "dev-context-only-utils")]
@@ -786,6 +828,18 @@ impl Tower {
         false
     }
 
+    pub fn is_slot_mostly_confirmed(
+        &self,
+        slot: Slot,
+        voted_stakes: &VotedStakes,
+        total_stake: Stake,
+    ) -> bool {
+        voted_stakes
+            .get(&slot)
+            .map(|stake| (*stake as f64 / total_stake as f64) > self.vo_config.mostly_confirmed_threshold)
+            .unwrap_or(false)
+    }
+
     pub fn is_locked_out(&self, slot: Slot, ancestors: &HashSet<Slot>) -> bool {
         if !self.is_recent(slot) {
             return true;
@@ -796,7 +850,7 @@ impl Tower {
         // remaining voted slots are on a different fork from the checked slot,
         // it's still locked out.
         let mut vote_state = self.vote_state.clone();
-        vote_state.process_next_vote_slot(slot);
+        vote_state.process_next_vote_slot(slot, true);
         for vote in &vote_state.votes {
             if slot != vote.slot() && !ancestors.contains(&vote.slot()) {
                 return true;
@@ -815,6 +869,63 @@ impl Tower {
         }
 
         false
+    }
+
+    // This version first pushes all of the 'including' slots onto the bank before evaluating 'slot'
+    pub fn is_locked_out_including(
+        &self,
+        slot: Slot,
+        ancestors: &HashSet<Slot>,
+        including: &Vec<Slot>,
+    ) -> bool {
+        if !self.is_recent(slot) {
+            return true;
+        }
+
+        // Check if a slot is locked out by simulating adding a vote for that
+        // slot to the current lockouts to pop any expired votes. If any of the
+        // remaining voted slots are on a different fork from the checked slot,
+        // it's still locked out.
+        let mut vote_state = self.vote_state.clone();
+
+        for slot in including {
+            vote_state.process_next_vote_slot(*slot, true);
+        }
+
+        vote_state.process_next_vote_slot(slot, true);
+        for vote in &vote_state.votes {
+            if slot != vote.slot() && !ancestors.contains(&vote.slot()) {
+                return true;
+            }
+        }
+
+        if let Some(root_slot) = vote_state.root_slot {
+            if slot != root_slot {
+                // This case should never happen because bank forks purges all
+                // non-descendants of the root every time root is set
+                assert!(
+                    ancestors.contains(&root_slot),
+                    "ancestors: {ancestors:?}, slot: {slot} root: {root_slot}"
+                );
+            }
+        }
+
+        false
+    }
+
+    pub fn pop_votes_locked_out_at(&self, new_votes: &mut Vec<Slot>, slot: Slot) {
+        let mut vote_state = self.vote_state.clone();
+
+        for i in 0..new_votes.len() {
+            vote_state.process_next_vote_slot(new_votes[i], true);
+            if let Some(last_lockout) = vote_state.last_lockout() {
+                if last_lockout.is_locked_out_at_slot(slot) {
+                    // New votes cannot include this or any subsequent slots
+                    new_votes.truncate(i);
+                    return;
+                }
+            }
+        }
     }
 
     /// Checks if a vote for `candidate_slot` is usable in a switching proof
@@ -1092,33 +1203,33 @@ impl Tower {
                 .map(|stats| stats.computed)
                 .unwrap_or(false)
                 || {
-                    // If any of the descendants have the `computed` flag set, then there must be a more
-                    // recent frozen bank on this fork to use, so we can ignore this one. Otherwise,
-                    // even if this bank has descendants, if they have not yet been frozen / stats computed,
-                    // then use this bank as a representative for the fork.
-                    descendants.iter().any(|d| {
-                        progress
-                            .get_fork_stats(*d)
-                            .map(|stats| stats.computed)
-                            .unwrap_or(false)
-                    })
-                }
+                // If any of the descendants have the `computed` flag set, then there must be a more
+                // recent frozen bank on this fork to use, so we can ignore this one. Otherwise,
+                // even if this bank has descendants, if they have not yet been frozen / stats computed,
+                // then use this bank as a representative for the fork.
+                descendants.iter().any(|d| {
+                    progress
+                        .get_fork_stats(*d)
+                        .map(|stats| stats.computed)
+                        .unwrap_or(false)
+                })
+            }
                 || *candidate_slot == last_voted_slot
                 || *candidate_slot <= root
                 || {
-                    !self
-                        .is_valid_switching_proof_vote(
-                            *candidate_slot,
-                            last_voted_slot,
-                            switch_slot,
-                            ancestors,
-                            last_vote_ancestors,
-                        )
-                        .expect(
-                            "candidate_slot and switch_slot exist in descendants map,
+                !self
+                    .is_valid_switching_proof_vote(
+                        *candidate_slot,
+                        last_voted_slot,
+                        switch_slot,
+                        ancestors,
+                        last_vote_ancestors,
+                    )
+                    .expect(
+                        "candidate_slot and switch_slot exist in descendants map,
                         so they must exist in ancestors map",
-                        )
-                }
+                    )
+            }
             {
                 continue;
             }
@@ -1211,7 +1322,7 @@ impl Tower {
                     ancestors,
                     last_vote_ancestors,
                 )
-                .unwrap_or(false)
+                    .unwrap_or(false)
             } {
                 let stake = epoch_vote_accounts
                     .get(vote_account_pubkey)
@@ -1276,7 +1387,7 @@ impl Tower {
     // could have helped us pass the threshold check. Worst case, we'll just
     // recheck later without having increased lockouts.
     fn optimistically_bypass_vote_stake_threshold_check<'a>(
-        tower_before_applying_vote: impl Iterator<Item = &'a Lockout>,
+        tower_before_applying_vote: impl Iterator<Item=&'a Lockout>,
         threshold_vote: &Lockout,
     ) -> bool {
         for old_vote in tower_before_applying_vote {
@@ -1292,7 +1403,7 @@ impl Tower {
     /// Checks a single vote threshold for `slot`
     fn check_vote_stake_threshold<'a>(
         threshold_vote: Option<&Lockout>,
-        tower_before_applying_vote: impl Iterator<Item = &'a Lockout>,
+        tower_before_applying_vote: impl Iterator<Item=&'a Lockout>,
         threshold_depth: usize,
         threshold_size: f64,
         slot: Slot,
@@ -1338,7 +1449,7 @@ impl Tower {
         let mut threshold_decisions = vec![];
         // Generate the vote state assuming this vote is included.
         let mut vote_state = self.vote_state.clone();
-        vote_state.process_next_vote_slot(slot);
+        vote_state.process_next_vote_slot(slot, true);
 
         // Assemble all the vote thresholds and depths to check.
         let vote_thresholds_and_depths = vec![
@@ -1373,7 +1484,7 @@ impl Tower {
     /// Update lockouts for all the ancestors
     pub(crate) fn populate_ancestor_voted_stakes(
         voted_stakes: &mut VotedStakes,
-        vote_slots: impl IntoIterator<Item = Slot>,
+        vote_slots: impl IntoIterator<Item=Slot>,
         ancestors: &HashMap<Slot, HashSet<Slot>>,
     ) {
         // If there's no ancestors, that means this slot must be from before the current root,
@@ -1388,6 +1499,26 @@ impl Tower {
             }
         }
     }
+
+    pub fn update_config(&mut self) {
+        let now = Local::now().timestamp();
+
+        if self.vo_config.last_reload + 60 > now {
+            return;
+        } else {
+            match VoteOptimizationConfig::load_from_yaml_file(
+                &std::env::var("VO_CONFIG_PATH").unwrap_or("vo_config.yaml".to_string())
+            ) {
+                Ok(vo_config) => {
+                    info!("reloaded vo_config: {:?}", &vo_config);
+                    self.vo_config = vo_config;
+                },
+                Err(e) => error!("Failed to load vo_config.yaml: {}", e),
+            };
+            self.vo_config.last_reload = now;
+        }
+    }
+
 
     /// Update stake for all the ancestors.
     /// Note, stake is the same for all the ancestor.
@@ -1441,7 +1572,7 @@ impl Tower {
             self.last_vote == VoteTransaction::from(VoteStateUpdate::default())
                 && self.vote_state.votes.is_empty()
                 || self.last_vote == VoteTransaction::from(TowerSync::default())
-                    && self.vote_state.votes.is_empty()
+                && self.vote_state.votes.is_empty()
                 || !self.vote_state.votes.is_empty(),
             "last vote: {:?} vote_state.votes: {:?}",
             self.last_vote,
@@ -1826,7 +1957,7 @@ pub mod test {
                     &VoteStateVersions::new_current(vote_state),
                     account.data_as_mut_slice(),
                 )
-                .expect("serialize state");
+                    .expect("serialize state");
                 (
                     solana_pubkey::new_rand(),
                     (*lamports, VoteAccount::try_from(account).unwrap()),
@@ -1905,7 +2036,7 @@ pub mod test {
         // Simulate the votes
         for vote in votes {
             assert!(vote_simulator
-                .simulate_vote(vote, &node_pubkey, &mut tower,)
+                .simulate_vote(vote, &node_pubkey, &mut tower, )
                 .is_empty());
         }
 
@@ -1943,15 +2074,15 @@ pub mod test {
         // Create the tree of banks
         let forks = tr(0)
             / (tr(1)
-                / (tr(2)
-                    // Minor fork 1
-                    / (tr(10) / (tr(11) / (tr(12) / (tr(13) / (tr(14))))))
-                    / (tr(43)
-                        / (tr(44)
-                            // Minor fork 2
-                            / (tr(45) / (tr(46) / (tr(47) / (tr(48) / (tr(49) / (tr(50)))))))
-                            / (tr(110)))
-                        / tr(112))));
+            / (tr(2)
+            // Minor fork 1
+            / (tr(10) / (tr(11) / (tr(12) / (tr(13) / (tr(14))))))
+            / (tr(43)
+            / (tr(44)
+            // Minor fork 2
+            / (tr(45) / (tr(46) / (tr(47) / (tr(48) / (tr(49) / (tr(50)))))))
+            / (tr(110)))
+            / tr(112))));
 
         // Fill the BankForks according to the above fork structure
         vote_simulator.fill_bank_forks(forks, &HashMap::new(), true);
@@ -2336,14 +2467,14 @@ pub mod test {
         let mut tower = Tower::default();
         let forks = tr(0)
             / (tr(1)
-                / (tr(2)
-                    // Minor fork 1
-                    / (tr(10) / (tr(11) / (tr(12) / (tr(13) / (tr(14))))))
-                    / (tr(43)
-                        / (tr(44)
-                            // Minor fork 2
-                            / (tr(45) / (tr(46))))
-                        / (tr(110)))));
+            / (tr(2)
+            // Minor fork 1
+            / (tr(10) / (tr(11) / (tr(12) / (tr(13) / (tr(14))))))
+            / (tr(43)
+            / (tr(44)
+            // Minor fork 2
+            / (tr(45) / (tr(46))))
+            / (tr(110)))));
 
         // Have two validators, each representing 20% of the stake vote on
         // minor fork 2 at slots 46 + 47
@@ -2354,7 +2485,7 @@ pub mod test {
 
         // Vote on the first minor fork at slot 14, should succeed
         assert!(vote_simulator
-            .simulate_vote(14, &node_pubkey, &mut tower,)
+            .simulate_vote(14, &node_pubkey, &mut tower, )
             .is_empty());
 
         // The other two validators voted at slots 46, 47, which
@@ -2395,21 +2526,21 @@ pub mod test {
         // Create the tree of banks
         let forks = tr(0)
             / (tr(1)
-                / (tr(2)
-                    / (tr(3)
-                        / (tr(4)
-                            / (tr(5)
-                                / (tr(6)
-                                    / (tr(7)
-                                        / (tr(8)
-                                            / (tr(9)
-                                                // Minor fork 1
-                                                / (tr(10) / (tr(11) / (tr(12) / (tr(13) / (tr(14))))))
-                                                / (tr(43)
-                                                    / (tr(44)
-                                                        // Minor fork 2
-                                                        / (tr(45) / (tr(46) / (tr(47) / (tr(48) / (tr(49) / (tr(50)))))))
-                                                        / (tr(110) / (tr(110 + 2 * num_slots_to_try))))))))))))));
+            / (tr(2)
+            / (tr(3)
+            / (tr(4)
+            / (tr(5)
+            / (tr(6)
+            / (tr(7)
+            / (tr(8)
+            / (tr(9)
+            // Minor fork 1
+            / (tr(10) / (tr(11) / (tr(12) / (tr(13) / (tr(14))))))
+            / (tr(43)
+            / (tr(44)
+            // Minor fork 2
+            / (tr(45) / (tr(46) / (tr(47) / (tr(48) / (tr(49) / (tr(50)))))))
+            / (tr(110) / (tr(110 + 2 * num_slots_to_try))))))))))))));
 
         // Set the successful voting behavior
         let mut cluster_votes = HashMap::new();
@@ -2433,7 +2564,7 @@ pub mod test {
         for vote in &my_votes {
             // All these votes should be ok
             assert!(vote_simulator
-                .simulate_vote(*vote, &node_pubkey, &mut tower,)
+                .simulate_vote(*vote, &node_pubkey, &mut tower, )
                 .is_empty());
         }
 
@@ -2722,8 +2853,8 @@ pub mod test {
             (VOTE_THRESHOLD_DEPTH_SHALLOW as u64, 2),
             ((VOTE_THRESHOLD_DEPTH_SHALLOW as u64) - 1, 2),
         ]
-        .into_iter()
-        .collect();
+            .into_iter()
+            .collect();
         for slot in 0..VOTE_THRESHOLD_DEPTH {
             tower.record_vote(slot as Slot, Hash::default());
         }
@@ -3006,13 +3137,13 @@ pub mod test {
         // Create the tree of banks
         let forks = tr(0)
             / (tr(1)
-                / (tr(2)
-                    / tr(10)
-                    / (tr(43)
-                        / (tr(44)
-                            // Minor fork 2
-                            / (tr(45) / (tr(46) / (tr(47) / (tr(48) / (tr(49) / (tr(50)))))))
-                            / (tr(110) / tr(111))))));
+            / (tr(2)
+            / tr(10)
+            / (tr(43)
+            / (tr(44)
+            // Minor fork 2
+            / (tr(45) / (tr(46) / (tr(47) / (tr(48) / (tr(49) / (tr(50)))))))
+            / (tr(110) / tr(111))))));
 
         // Fill the BankForks according to the above fork structure
         vote_simulator.fill_bank_forks(forks, &HashMap::new(), true);
@@ -3094,13 +3225,13 @@ pub mod test {
         let total_stake = bank0.total_epoch_stake();
         let forks = tr(0)
             / (tr(1)
-                / (tr(2)
-                    / tr(10)
-                    / (tr(43)
-                        / (tr(44)
-                            // Minor fork 2
-                            / (tr(45) / (tr(46) / (tr(47) / (tr(48) / (tr(49) / (tr(50)))))))
-                            / (tr(110) / tr(111))))));
+            / (tr(2)
+            / tr(10)
+            / (tr(43)
+            / (tr(44)
+            // Minor fork 2
+            / (tr(45) / (tr(46) / (tr(47) / (tr(48) / (tr(49) / (tr(50)))))))
+            / (tr(110) / tr(111))))));
         let replayed_root_slot = 44;
 
         // Fill the BankForks according to the above fork structure
@@ -3271,7 +3402,7 @@ pub mod test {
             &blockstore,
             &mut blockstore.max_root(),
         )
-        .unwrap();
+            .unwrap();
 
         assert!(!blockstore.is_root(0));
         assert!(blockstore.is_root(1));
@@ -3308,7 +3439,7 @@ pub mod test {
             &blockstore,
             &mut blockstore.max_root(),
         )
-        .unwrap();
+            .unwrap();
     }
 
     #[test]
@@ -3333,7 +3464,7 @@ pub mod test {
             &blockstore,
             &mut blockstore.max_root(),
         )
-        .unwrap();
+            .unwrap();
         assert_eq!(blockstore.max_root(), 0);
     }
 
@@ -3732,13 +3863,13 @@ pub mod test {
         //                    \- 113
         let forks = tr(0)
             / (tr(1)
-                / (tr(2)
-                    / tr(51)
-                    / (tr(43)
-                        / (tr(44)
-                            / (tr(45) / (tr(46) / (tr(47) / (tr(48) / tr(49) / tr(50)))))
-                            / tr(113)
-                            / (tr(110) / tr(111) / tr(112))))));
+            / (tr(2)
+            / tr(51)
+            / (tr(43)
+            / (tr(44)
+            / (tr(45) / (tr(46) / (tr(47) / (tr(48) / tr(49) / tr(50)))))
+            / tr(113)
+            / (tr(110) / tr(111) / tr(112))))));
         let switch_slot = 111;
 
         // Fill the BankForks according to the above fork structure

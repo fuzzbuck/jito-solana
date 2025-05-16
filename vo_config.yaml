@@ -1,0 +1,4 @@
+mostly_confirmed_threshold: 0.45
+threshold_ahead_count: 4
+after_skip_threshold: 0
+threshold_escape_count: 24

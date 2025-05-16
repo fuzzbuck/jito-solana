@@ -1,0 +1,1539 @@
+Subject: [PATCH] v5121
+---
+Index: core/src/consensus/progress_map.rs
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/core/src/consensus/progress_map.rs b/core/src/consensus/progress_map.rs
+--- a/core/src/consensus/progress_map.rs	(revision 901f632e0c82982fa314085e538b6b355160e60b)
++++ b/core/src/consensus/progress_map.rs	(date 1737738642182)
+@@ -187,6 +187,7 @@
+     pub is_locked_out: bool,
+     pub voted_stakes: VotedStakes,
+     pub duplicate_confirmed_hash: Option<Hash>,
++    pub is_mostly_confirmed: bool,
+     pub computed: bool,
+     pub lockout_intervals: LockoutIntervals,
+     pub bank_hash: Option<Hash>,
+@@ -373,6 +374,11 @@
+         slot_progress.fork_stats.duplicate_confirmed_hash = Some(hash);
+     }
+ 
++    pub fn set_mostly_confirmed_slot(&mut self, slot: Slot) {
++        let slot_progress = self.get_mut(&slot).unwrap();
++        slot_progress.fork_stats.is_mostly_confirmed = true;
++    }
++
+     pub fn is_duplicate_confirmed(&self, slot: Slot) -> Option<bool> {
+         self.progress_map
+             .get(&slot)
+Index: core/src/consensus.rs
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/core/src/consensus.rs b/core/src/consensus.rs
+--- a/core/src/consensus.rs	(revision 901f632e0c82982fa314085e538b6b355160e60b)
++++ b/core/src/consensus.rs	(date 1737738462726)
+@@ -42,10 +42,13 @@
+     std::{
+         cmp::Ordering,
+         collections::{HashMap, HashSet},
++        fs::read_to_string,
+         ops::{
+             Bound::{Included, Unbounded},
+             Deref,
+         },
++        path::Path,
++        time::SystemTime,
+     },
+     thiserror::Error,
+ };
+@@ -203,6 +206,11 @@
+                     last_timestamp: tower.last_timestamp,
+                     stray_restored_slot: tower.stray_restored_slot,
+                     last_switch_threshold_check: tower.last_switch_threshold_check,
++                    mostly_confirmed_threshold: None,
++                    threshold_ahead_count: None,
++                    after_skip_threshold: None,
++                    threshold_escape_count: None,
++                    last_config_check_seconds: 0,
+                 }
+             }
+             TowerVersions::V1_14_11(tower) => Tower {
+@@ -216,6 +224,11 @@
+                 last_timestamp: tower.last_timestamp,
+                 stray_restored_slot: tower.stray_restored_slot,
+                 last_switch_threshold_check: tower.last_switch_threshold_check,
++                mostly_confirmed_threshold: None,
++                threshold_ahead_count: None,
++                after_skip_threshold: None,
++                threshold_escape_count: None,
++                last_config_check_seconds: 0,
+             },
+             TowerVersions::Current(tower) => tower,
+         }
+@@ -266,6 +279,16 @@
+     stray_restored_slot: Option<Slot>,
+     #[serde(skip)]
+     pub last_switch_threshold_check: Option<(Slot, SwitchForkDecision)>,
++    #[serde(skip)]
++    mostly_confirmed_threshold: Option<f64>,
++    #[serde(skip)]
++    threshold_ahead_count: Option<u8>,
++    #[serde(skip)]
++    after_skip_threshold: Option<u8>,
++    #[serde(skip)]
++    threshold_escape_count: Option<u8>,
++    #[serde(skip)]
++    last_config_check_seconds: u64,
+ }
+ 
+ impl Default for Tower {
+@@ -280,6 +303,11 @@
+             last_vote_tx_blockhash: BlockhashStatus::default(),
+             stray_restored_slot: Option::default(),
+             last_switch_threshold_check: Option::default(),
++            mostly_confirmed_threshold: None,
++            threshold_ahead_count: None,
++            after_skip_threshold: None,
++            threshold_escape_count: None,
++            last_config_check_seconds: 0,
+         };
+         // VoteState::root_slot is ensured to be Some in Tower
+         tower.vote_state.root_slot = Some(Slot::default());
+@@ -522,6 +550,32 @@
+             .unwrap_or(false)
+     }
+ 
++    pub fn is_mostly_confirmed_threshold_enabled(&self) -> bool {
++        if let Some(_) = self.mostly_confirmed_threshold {
++            true
++        } else {
++            false
++        }
++    }
++
++    pub fn is_slot_mostly_confirmed(
++        &self,
++        slot: Slot,
++        voted_stakes: &VotedStakes,
++        total_stake: Stake,
++    ) -> bool {
++        let mostly_confirmed_threshold = if let Some(m) = self.mostly_confirmed_threshold {
++            m
++        } else {
++            SWITCH_FORK_THRESHOLD
++        };
++
++        voted_stakes
++            .get(&slot)
++            .map(|stake| (*stake as f64 / total_stake as f64) > mostly_confirmed_threshold)
++            .unwrap_or(false)
++    }
++
+     pub fn tower_slots(&self) -> Vec<Slot> {
+         self.vote_state.tower()
+     }
+@@ -587,7 +641,7 @@
+         vote_state.last_voted_slot()
+     }
+ 
+-    pub fn record_bank_vote(&mut self, bank: &Bank) -> Option<Slot> {
++    pub fn record_bank_vote(&mut self, bank: &Bank, pop_expired: bool) -> Option<Slot> {
+         // Returns the new root if one is made after applying a vote for the given bank to
+         // `self.vote_state`
+         let block_id = bank.block_id().unwrap_or_else(|| {
+@@ -603,6 +657,7 @@
+             bank.feature_set
+                 .is_active(&solana_feature_set::enable_tower_sync_ix::id()),
+             block_id,
++            pop_expired
+         )
+     }
+ 
+@@ -641,18 +696,145 @@
+         self.last_vote = new_vote;
+     }
+ 
++    pub fn update_config(&mut self) {
++        // Use this opportunity to possibly load new value for mostly_confirmed_threshold
++        let config_check_seconds = SystemTime::now()
++            .duration_since(SystemTime::UNIX_EPOCH)
++            .ok()
++            .map_or(0, |x| x.as_secs());
++        if config_check_seconds >= (self.last_config_check_seconds + 60) {
++            // Format of mostly_confirmed_threshold:
++            // a.float b.int c.int d.int
++            // a is threshold - no slot that hasn't already achieved this vote weight will be voted on, except for
++            //   slots in the "vote ahead of threshold" region, unless the escape hatch distance has been reached
++            // b is "vote ahead of threshold" - how many slots ahead of the threshold slot to vote, regardless of
++            //   vote weight.  Reduces vote latency.
++            // c controls what stake weighted vote percentage is required on a slot after there have been skips.  It
++            //   must be one of these values:
++            //   0 -- no restriction
++            //   1 -- a slot after a skip has to have mostly_confirmed_threshold before it will be voted on
++            //   2 -- a slot after a skip has to be confirmed already before it will be voted on
++            // d is "escape hatch distance".  This is the number of slots of non-voting while waiting for threshold
++            //   to just vote anyway.  This is an escape hatch to allow network progress even if threshold is not
++            //   being achieved.  Without this, there could be deadlock if all validators ran this voting strategy
++            //   beacuse if multiple forks happen at once, it's possible for all forks to end up with less than
++            //   the threshold vote and no validator would ever switch forks.
++            warn!("Checking for change to mostly_confirmed_threshold");
++            self.last_config_check_seconds = config_check_seconds;
++            match read_to_string(&Path::new("./mostly_confirmed_threshold")) {
++                Ok(s) => {
++                    let split = s
++                        .strip_suffix("\n")
++                        .unwrap_or("")
++                        .split_whitespace()
++                        .collect::<Vec<&str>>();
++                    match split.get(0).unwrap_or(&"").parse::<f64>() {
++                        Ok(threshold) => {
++                            if let Some(mostly_confirmed_threshold) =
++                                self.mostly_confirmed_threshold
++                            {
++                                if mostly_confirmed_threshold != threshold {
++                                    self.mostly_confirmed_threshold = Some(threshold);
++                                    warn!("Using new mostly_confirmed_threshold: {}", threshold);
++                                }
++                            } else {
++                                self.mostly_confirmed_threshold = Some(threshold);
++                                warn!("Using new mostly_confirmed_threshold: {}", threshold);
++                            }
++                        }
++                        _ => {
++                            warn!("Using NO mostly_confirmed_threshold");
++                            self.mostly_confirmed_threshold = None;
++                        }
++                    }
++                    match split.get(1).unwrap_or(&"").parse::<u8>() {
++                        Ok(count) => {
++                            if let Some(already_count) = self.threshold_ahead_count {
++                                if already_count != count {
++                                    self.threshold_ahead_count = Some(count);
++                                    warn!("Using new threshold_ahead_count: {}", count);
++                                }
++                            } else {
++                                self.threshold_ahead_count = Some(count);
++                                warn!("Using new threshold_ahead_count: {}", count);
++                            }
++                        }
++                        _ => {
++                            warn!("Using NO threshold_ahead_count");
++                            self.threshold_ahead_count = None;
++                        }
++                    }
++                    match split.get(2).unwrap_or(&"").parse::<u8>() {
++                        Ok(threshold) => {
++                            if let Some(already_after_skip_threshold) = self.after_skip_threshold {
++                                if already_after_skip_threshold != threshold {
++                                    self.after_skip_threshold = Some(threshold);
++                                    warn!("Using new after_skip_threshold: {}", threshold);
++                                }
++                            } else {
++                                self.after_skip_threshold = Some(threshold);
++                                warn!("Using new after_skip_threshold: {}", threshold);
++                            }
++                        }
++                        _ => {
++                            warn!("Using NO after_skip_threshold");
++                            self.after_skip_threshold = None;
++                        }
++                    }
++                    match split.get(3).unwrap_or(&"").parse::<u8>() {
++                        Ok(escape) => {
++                            if let Some(already_escape) = self.threshold_escape_count {
++                                if already_escape != escape {
++                                    self.threshold_escape_count = Some(escape);
++                                    warn!("Using new threshold_escape_count: {}", escape);
++                                }
++                            } else {
++                                self.threshold_escape_count = Some(escape);
++                                warn!("Using new threshold_escape_count: {}", escape);
++                            }
++                        }
++                        _ => {
++                            warn!("Using NO threshold_escape_count");
++                            self.threshold_escape_count = None;
++                        }
++                    }
++                }
++                _ => {
++                    warn!("Using NO mostly_confirmed_threshold, threshold_ahead_count, after_skip_threshold, or threshold_escape_count");
++                    self.mostly_confirmed_threshold = None;
++                    self.threshold_ahead_count = None;
++                    self.after_skip_threshold = None;
++                    self.threshold_escape_count = None;
++                }
++            }
++        }
++    }
++
++    pub fn get_threshold_ahead_count(&self) -> Option<u8> {
++        return self.threshold_ahead_count;
++    }
++
++    pub fn get_after_skip_threshold(&self) -> Option<u8> {
++        return self.after_skip_threshold;
++    }
++
++    pub fn get_threshold_escape_count(&self) -> Option<u8> {
++        return self.threshold_escape_count;
++    }
++
+     fn record_bank_vote_and_update_lockouts(
+         &mut self,
+         vote_slot: Slot,
+         vote_hash: Hash,
+         enable_tower_sync_ix: bool,
+         block_id: Hash,
++        pop_expired: bool,
+     ) -> Option<Slot> {
+         trace!("{} record_vote for {}", self.node_pubkey, vote_slot);
+         let old_root = self.root();
+ 
+         let vote = Vote::new(vec![vote_slot], vote_hash);
+-        let result = process_vote_unchecked(&mut self.vote_state, vote);
++        let result = process_vote_unchecked(&mut self.vote_state, vote, pop_expired);
+         if result.is_err() {
+             panic!(
+                 "Error while recording vote {} {} in local tower {:?}",
+@@ -677,7 +859,7 @@
+ 
+     #[cfg(feature = "dev-context-only-utils")]
+     pub fn record_vote(&mut self, slot: Slot, hash: Hash) -> Option<Slot> {
+-        self.record_bank_vote_and_update_lockouts(slot, hash, true, Hash::default())
++        self.record_bank_vote_and_update_lockouts(slot, hash, true, Hash::default(), true)
+     }
+ 
+     #[cfg(feature = "dev-context-only-utils")]
+@@ -797,6 +979,63 @@
+         false
+     }
+ 
++    // This version first pushes all of the 'including' slots onto the bank before evaluating 'slot'
++    pub fn is_locked_out_including(
++        &self,
++        slot: Slot,
++        ancestors: &HashSet<Slot>,
++        including: &Vec<Slot>,
++    ) -> bool {
++        if !self.is_recent(slot) {
++            return true;
++        }
++
++        // Check if a slot is locked out by simulating adding a vote for that
++        // slot to the current lockouts to pop any expired votes. If any of the
++        // remaining voted slots are on a different fork from the checked slot,
++        // it's still locked out.
++        let mut vote_state = self.vote_state.clone();
++
++        for slot in including {
++            process_slot_vote_unchecked(&mut vote_state, *slot);
++        }
++
++        process_slot_vote_unchecked(&mut vote_state, slot);
++        for vote in &vote_state.votes {
++            if slot != vote.slot() && !ancestors.contains(&vote.slot()) {
++                return true;
++            }
++        }
++
++        if let Some(root_slot) = vote_state.root_slot {
++            if slot != root_slot {
++                // This case should never happen because bank forks purges all
++                // non-descendants of the root every time root is set
++                assert!(
++                    ancestors.contains(&root_slot),
++                    "ancestors: {ancestors:?}, slot: {slot} root: {root_slot}"
++                );
++            }
++        }
++
++        false
++    }
++
++    pub fn pop_votes_locked_out_at(&self, new_votes: &mut Vec<Slot>, slot: Slot) {
++        let mut vote_state = self.vote_state.clone();
++
++        for i in 0..new_votes.len() {
++            process_slot_vote_unchecked(&mut vote_state, new_votes[i]);
++            if let Some(last_lockout) = vote_state.last_lockout() {
++                if last_lockout.is_locked_out_at_slot(slot) {
++                    // New votes cannot include this or any subsequent slots
++                    new_votes.truncate(i);
++                    return;
++                }
++            }
++        }
++    }
++
+     /// Checks if a vote for `candidate_slot` is usable in a switching proof
+     /// from `last_voted_slot` to `switch_slot`.
+     /// We assume `candidate_slot` is not an ancestor of `last_voted_slot`.
+Index: core/src/vote_simulator.rs
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/core/src/vote_simulator.rs b/core/src/vote_simulator.rs
+--- a/core/src/vote_simulator.rs	(revision 901f632e0c82982fa314085e538b6b355160e60b)
++++ b/core/src/vote_simulator.rs	(date 1737742833262)
+@@ -111,6 +111,7 @@
+                                 vec![parent],
+                                 parent_bank.hash(),
+                             ),
++                            true
+                         )
+                         .unwrap();
+                         TowerSync::new(
+@@ -205,6 +206,7 @@
+ 
+         // Try to vote on the given slot
+         let descendants = self.bank_forks.read().unwrap().descendants();
++        let mut last_logged_vote_slot = 0;
+         let SelectVoteAndResetForkResult {
+             heaviest_fork_failures,
+             ..
+@@ -217,6 +219,7 @@
+             tower,
+             &self.latest_validator_votes_for_frozen_banks,
+             &self.heaviest_subtree_fork_choice,
++            &mut last_logged_vote_slot,
+         );
+ 
+         // Make sure this slot isn't locked out or failing threshold
+@@ -225,7 +228,7 @@
+             return heaviest_fork_failures;
+         }
+ 
+-        let new_root = tower.record_bank_vote(&vote_bank);
++        let new_root = tower.record_bank_vote(&vote_bank, true);
+         if let Some(new_root) = new_root {
+             self.set_root(new_root);
+         }
+Index: core/src/replay_stage.rs
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/core/src/replay_stage.rs b/core/src/replay_stage.rs
+--- a/core/src/replay_stage.rs	(revision 901f632e0c82982fa314085e538b6b355160e60b)
++++ b/core/src/replay_stage.rs	(date 1737742362641)
+@@ -658,6 +658,8 @@
+                 &leader_schedule_cache,
+             );
+ 
++            let mut last_logged_vote_slot: Slot = u64::MAX;
++
+             loop {
+                 // Stop getting entries if we get exit signal
+                 if exit.load(Ordering::Relaxed) {
+@@ -843,7 +845,7 @@
+                 let mut compute_slot_stats_time = Measure::start("compute_slot_stats_time");
+                 for slot in newly_computed_slot_stats {
+                     let fork_stats = progress.get_fork_stats(slot).unwrap();
+-                    let duplicate_confirmed_forks = Self::tower_duplicate_confirmed_forks(
++                    let (duplicate_confirmed_forks, mostly_confirmed_slots) = Self::tower_duplicate_confirmed_forks(
+                         &tower,
+                         &fork_stats.voted_stakes,
+                         fork_stats.total_stake,
+@@ -853,6 +855,7 @@
+ 
+                     Self::mark_slots_duplicate_confirmed(
+                         &duplicate_confirmed_forks,
++                        &mostly_confirmed_slots,
+                         &blockstore,
+                         &bank_forks,
+                         &mut progress,
+@@ -900,6 +903,7 @@
+                     &mut tower,
+                     &latest_validator_votes_for_frozen_banks,
+                     &heaviest_subtree_fork_choice,
++                    &mut last_logged_vote_slot,
+                 );
+                 select_vote_and_reset_forks_time.stop();
+ 
+@@ -941,6 +945,8 @@
+                 }
+                 heaviest_fork_failures_time.stop();
+ 
++                tower.update_config();
++
+                 let mut voting_time = Measure::start("voting_time");
+                 // Vote on a fork
+                 if let Some((ref vote_bank, ref switch_fork_decision)) = vote_bank {
+@@ -955,36 +961,239 @@
+                         );
+                     }
+ 
+-                    if let Err(e) = Self::handle_votable_bank(
+-                        vote_bank,
+-                        switch_fork_decision,
+-                        &bank_forks,
+-                        &mut tower,
+-                        &mut progress,
+-                        &vote_account,
+-                        &identity_keypair,
+-                        &authorized_voter_keypairs.read().unwrap(),
+-                        &blockstore,
+-                        &leader_schedule_cache,
+-                        &lockouts_sender,
+-                        &accounts_background_request_sender,
+-                        &rpc_subscriptions,
+-                        &block_commitment_cache,
+-                        &mut heaviest_subtree_fork_choice,
+-                        &bank_notification_sender,
+-                        &mut duplicate_slots_tracker,
+-                        &mut duplicate_confirmed_slots,
+-                        &mut unfrozen_gossip_verified_vote_hashes,
+-                        &mut voted_signatures,
+-                        &mut has_new_vote_been_rooted,
+-                        &mut replay_timing,
+-                        &voting_sender,
+-                        &mut epoch_slots_frozen_slots,
+-                        &drop_bank_sender,
+-                        wait_to_vote_slot,
+-                    ) {
+-                        error!("Unable to set root: {e}");
+-                        return;
++                    let mut vote_banks = vec![];
++                    let mut pop_expired = true;
++
++                    // If threshold voting is enabled ...
++                    if let Some(threshold_ahead_count) = tower.get_threshold_ahead_count() {
++                        // The most recent voted slot will be needed
++                        let most_recent_voted_slot = tower.tower_slots().last().cloned();
++
++                        // Find the newest mostly_confirmed_bank on vote_bank's fork
++                        if let Some(mostly_confirmed_bank) =
++                            ReplayStage::first_mostly_confirmed_bank(vote_bank.clone(), &progress)
++                        {
++                            // If there is a prior vote, then take all banks between the most recently voted slot and
++                            // the new mostly_confirmed_bank, but not including either (the mostly_confirmed bank will
++                            // be included in the extend below).
++                            if let Some(most_recent_voted_slot) = most_recent_voted_slot {
++                                if let Some(mostly_confirmed_bank_parent) =
++                                    mostly_confirmed_bank.parent()
++                                {
++                                    vote_banks = ReplayStage::banks_between_and_including(
++                                        most_recent_voted_slot + 1,
++                                        mostly_confirmed_bank_parent.clone(),
++                                    );
++                                }
++                            }
++
++                            // Also take the mostly_confirmed bank plus threshold_ahead_count banks after it, up to
++                            // vote_bank.  If mostly_confirmed_bank is at or before the most recently voted slot, then
++                            // slots already voted on will be included, but will be removed by the filter operation
++                            // that follows this.
++                            vote_banks.extend(
++                                ReplayStage::banks_between_and_including(
++                                    mostly_confirmed_bank.slot(),
++                                    vote_bank.clone(),
++                                )
++                                    .into_iter()
++                                    .take((threshold_ahead_count + 1) as usize)
++                                    .collect::<Vec<Arc<Bank>>>(),
++                            );
++
++                            // Filter out:
++                            // 1. Already-voted-on banks
++                            // 2. Any banks which can't be voted on because they are locked out
++                            // 3. If there is a "skip ahead threshold", all votes after a skip if the first vote after
++                            //    the skip doesn't meet the threshold.
++                            // 4. All except the first 31 votes that aren't filtered by 1 - 3.
++                            let after_skip_threshold = tower.get_after_skip_threshold();
++                            let mut filtered_vote_banks = vec![];
++                            let mut filtered_vote_slots = vec![];
++                            for bank in &vote_banks {
++                                // 1
++                                if bank.slot() <= most_recent_voted_slot.unwrap_or(0) {
++                                    continue;
++                                }
++                                // 2
++                                if tower.is_locked_out_including(
++                                    bank.slot(),
++                                    ancestors.get(&bank.slot()).unwrap(),
++                                    &filtered_vote_slots,
++                                ) {
++                                    info!(
++                                        "vote-optimizer cannot vote on {} because it's locked out",
++                                        bank.slot()
++                                    );
++                                    continue;
++                                }
++                                // 3
++                                if bank.slot()
++                                    > (bank.parent().map(|parent| parent.slot()).unwrap_or(0) + 1)
++                                {
++                                    match after_skip_threshold {
++                                        Some(1) => {
++                                            if !progress
++                                                .get_fork_stats(bank.slot())
++                                                .unwrap()
++                                                .is_mostly_confirmed
++                                            {
++                                                info!(
++                                                    "vote-optimizer after skip refusing {}",
++                                                    bank.slot()
++                                                );
++                                                break;
++                                            }
++                                        }
++                                        Some(2) => {
++                                            if !progress
++                                                .get_fork_stats(bank.slot())
++                                                .unwrap()
++                                                .duplicate_confirmed_hash.is_some()
++                                            {
++                                                info!(
++                                                    "vote-optimizer after skip refusing {}",
++                                                    bank.slot()
++                                                );
++                                                break;
++                                            }
++                                        }
++                                        _ => (),
++                                    }
++                                }
++                                filtered_vote_banks.push(bank.clone());
++                                // 4
++                                if filtered_vote_banks.len() == 31 {
++                                    break;
++                                }
++                                filtered_vote_slots.push(bank.slot());
++                            }
++
++                            // Now filter out any banks which would increase lockout past the most recently
++                            // confirmed slot on this fork to > 64.  Remove the newest first so that they can
++                            // be voted on later if they end up being votable.
++                            if !filtered_vote_banks.is_empty() {
++                                let first_slot_to_not_lock_out =
++                                    ReplayStage::last_confirmed_slot(vote_bank, &progress) + 65;
++                                tower.pop_votes_locked_out_at(
++                                    &mut filtered_vote_slots,
++                                    first_slot_to_not_lock_out,
++                                );
++                                if filtered_vote_banks.len() > filtered_vote_slots.len() {
++                                    info!(
++                                        "vote-optimizer cannot vote on {} or subsequent slots because lockout would \
++                                         exceed slot {}",
++                                        filtered_vote_banks[filtered_vote_slots.len()].slot(),
++                                        first_slot_to_not_lock_out - 1);
++                                    filtered_vote_banks.truncate(filtered_vote_slots.len());
++                                }
++                            }
++
++                            vote_banks = filtered_vote_banks;
++
++                            // If there are no banks included, then check to see if there are more than
++                            // threshold_escape_count banks since the last voted bank that have not been voted on yet.
++                            // If there are, vote for the oldest not voted on bank, so as not to get too far behind
++                            // the cluster and miss voting opportunities.
++                            if vote_banks.is_empty() {
++                                if let Some(threshold_escape_count) =
++                                    tower.get_threshold_escape_count()
++                                {
++                                    if let Some(most_recent_voted_slot) = most_recent_voted_slot {
++                                        // Get all banks that could be voted on, which doesn't include banks that
++                                        // can't be voted on because they would be locked out
++                                        let mut unvoted_banks = vec![];
++                                        let mut unvoted_slots = vec![];
++                                        for bank in ReplayStage::banks_between_and_including(
++                                            most_recent_voted_slot + 1,
++                                            vote_bank.clone(),
++                                        ) {
++                                            if !tower.is_locked_out_including(
++                                                bank.slot(),
++                                                ancestors.get(&bank.slot()).unwrap(),
++                                                &unvoted_slots,
++                                            ) {
++                                                unvoted_banks.push(bank.clone());
++                                                unvoted_slots.push(bank.slot());
++                                            }
++                                        }
++
++                                        if unvoted_banks.len() > (threshold_escape_count as usize) {
++                                            info!(
++                                                "vote-optimizer voting on escape slot {}",
++                                                unvoted_banks[0].slot()
++                                            );
++                                            vote_banks.push(unvoted_banks[0].clone());
++                                        }
++                                    } else {
++                                        // Else have never voted; in this case, just vote on the proposed bank
++                                        info!(
++                                            "vote-optimizer never voted, so voting on {}",
++                                            vote_bank.slot()
++                                        );
++                                        vote_banks.push(vote_bank.clone());
++                                    }
++                                }
++                            }
++
++                            // Now expire votes from the tower's vote_state if they are on a different fork than the
++                            // votes.  Expiring only these votes is only allowed with VoteStateUpdate, which no longer
++                            // requires expiration of on-fork votes.
++                            if let Some(last_new_vote) = vote_banks.last() {
++                                let ancestors = ancestors.get(&last_new_vote.slot()).unwrap();
++                                while let Some(vote) = tower.vote_state.last_lockout() {
++                                    // If the vote is not an ancestor of the bank, then we must have just
++                                    // switched forks away from it, so remove it from the tower
++                                    if !ancestors.contains(&vote.slot()) {
++                                        info!("vote-optimizer purged {}", vote.slot());
++                                        tower.vote_state.votes.pop_back();
++                                    } else {
++                                        break;
++                                    }
++                                }
++                            }
++                            // Arrange for process_next_vote_slot() to be called with a flag telling it not to do
++                            // any popping since if there was any popping to be done, we already did it.
++                            pop_expired = false;
++                        }
++                    } else {
++                        // Not threshold voting, so just vote on the proposed bank
++                        vote_banks.push(vote_bank.clone());
++                    }
++
++                    if !vote_banks.is_empty() {
++                        if let Err(e) = Self::handle_votable_banks(
++                            &vote_banks,
++                            switch_fork_decision,
++                            &bank_forks,
++                            &mut tower,
++                            &mut progress,
++                            &vote_account,
++                            &identity_keypair,
++                            &authorized_voter_keypairs.read().unwrap(),
++                            &blockstore,
++                            &leader_schedule_cache,
++                            &lockouts_sender,
++                            &accounts_background_request_sender,
++                            &rpc_subscriptions,
++                            &block_commitment_cache,
++                            &mut heaviest_subtree_fork_choice,
++                            &bank_notification_sender,
++                            &mut duplicate_slots_tracker,
++                            &mut duplicate_confirmed_slots,
++                            &mut unfrozen_gossip_verified_vote_hashes,
++                            &mut voted_signatures,
++                            &mut has_new_vote_been_rooted,
++                            &mut replay_timing,
++                            &voting_sender,
++                            &mut epoch_slots_frozen_slots,
++                            &drop_bank_sender,
++                            wait_to_vote_slot,
++                            pop_expired,
++                        ) {
++                            error!("Unable to set root: {e}");
++                            return;
++                        }
+                     }
+                 }
+                 voting_time.stop();
+@@ -1347,6 +1556,56 @@
+         }
+     }
+ 
++    fn first_mostly_confirmed_bank(bank: Arc<Bank>, progress: &ProgressMap) -> Option<Arc<Bank>> {
++        if progress
++            .get_fork_stats(bank.slot())
++            .unwrap()
++            .is_mostly_confirmed
++        {
++            Some(bank.clone())
++        } else if let Some(parent) = bank.parent() {
++            ReplayStage::first_mostly_confirmed_bank(parent.clone(), progress)
++        } else {
++            None
++        }
++    }
++
++    fn last_confirmed_slot(bank: &Bank, progress: &ProgressMap) -> Slot {
++        if progress
++            .get_fork_stats(bank.slot())
++            .unwrap()
++            .duplicate_confirmed_hash.is_some()
++        {
++            bank.slot()
++        } else if let Some(parent) = bank.parent() {
++            ReplayStage::last_confirmed_slot(&parent, progress)
++        } else {
++            0
++        }
++    }
++
++    fn banks_between_and_including(first_slot: u64, last_bank: Arc<Bank>) -> Vec<Arc<Bank>> {
++        let mut banks = vec![];
++
++        let mut bank = last_bank;
++
++        loop {
++            if bank.slot() < first_slot {
++                break;
++            }
++
++            banks.push(bank.clone());
++
++            if let Some(parent) = bank.parent() {
++                bank = parent.clone();
++            } else {
++                break;
++            }
++        }
++
++        banks.into_iter().rev().collect()
++    }
++
+     fn is_partition_detected(
+         ancestors: &HashMap<Slot, HashSet<Slot>>,
+         last_voted_slot: Slot,
+@@ -2345,8 +2604,8 @@
+     }
+ 
+     #[allow(clippy::too_many_arguments)]
+-    fn handle_votable_bank(
+-        bank: &Arc<Bank>,
++    fn handle_votable_banks(
++        banks: &Vec<Arc<Bank>>,
+         switch_fork_decision: &SwitchForkDecision,
+         bank_forks: &Arc<RwLock<BankForks>>,
+         tower: &mut Tower,
+@@ -2372,33 +2631,41 @@
+         epoch_slots_frozen_slots: &mut EpochSlotsFrozenSlots,
+         drop_bank_sender: &Sender<Vec<BankWithScheduler>>,
+         wait_to_vote_slot: Option<Slot>,
++        pop_expired: bool,
+     ) -> Result<(), SetRootError> {
+-        if bank.is_empty() {
+-            datapoint_info!("replay_stage-voted_empty_bank", ("slot", bank.slot(), i64));
+-        }
+-        trace!("handle votable bank {}", bank.slot());
+-        let new_root = tower.record_bank_vote(bank);
++        assert!(!banks.is_empty());
++
++        // Track the newly voted on slots so that they can be logged
++        let mut new_slots = vec![];
++
++        for bank in banks.iter() {
++            if bank.is_empty() {
++                datapoint_info!("replay_stage-voted_empty_bank", ("slot", bank.slot(), i64));
++            }
++            new_slots.push(bank.slot());
++            trace!("handle votable bank {}", bank.slot());
++            let new_root = tower.record_bank_vote(bank, pop_expired);
+ 
+-        if let Some(new_root) = new_root {
+-            // get the root bank before squash
+-            let root_bank = bank_forks
+-                .read()
+-                .unwrap()
+-                .get(new_root)
+-                .expect("Root bank doesn't exist");
+-            let mut rooted_banks = root_bank.parents();
+-            let oldest_parent = rooted_banks.last().map(|last| last.parent_slot());
+-            rooted_banks.push(root_bank.clone());
+-            let rooted_slots: Vec<_> = rooted_banks.iter().map(|bank| bank.slot()).collect();
+-            // The following differs from  rooted_slots by including the parent slot of the oldest parent bank.
+-            let rooted_slots_with_parents = bank_notification_sender
+-                .as_ref()
+-                .map_or(false, |sender| sender.should_send_parents)
+-                .then(|| {
+-                    let mut new_chain = rooted_slots.clone();
+-                    new_chain.push(oldest_parent.unwrap_or_else(|| bank.parent_slot()));
+-                    new_chain
+-                });
++            if let Some(new_root) = new_root {
++                // get the root bank before squash
++                let root_bank = bank_forks
++                    .read()
++                    .unwrap()
++                    .get(new_root)
++                    .expect("Root bank doesn't exist");
++                let mut rooted_banks = root_bank.parents();
++                let oldest_parent = rooted_banks.last().map(|last| last.parent_slot());
++                rooted_banks.push(root_bank.clone());
++                let rooted_slots: Vec<_> = rooted_banks.iter().map(|bank| bank.slot()).collect();
++                // The following differs from  rooted_slots by including the parent slot of the oldest parent bank.
++                let rooted_slots_with_parents = bank_notification_sender
++                    .as_ref()
++                    .map_or(false, |sender| sender.should_send_parents)
++                    .then(|| {
++                        let mut new_chain = rooted_slots.clone();
++                        new_chain.push(oldest_parent.unwrap_or_else(|| bank.parent_slot()));
++                        new_chain
++                    });
+ 
+             // Call leader schedule_cache.set_root() before blockstore.set_root() because
+             // bank_forks.root is consumed by repair_service to update gossip, so we don't want to
+@@ -2430,55 +2697,59 @@
+                 drop_bank_sender,
+             )?;
+ 
+-            blockstore.slots_stats.mark_rooted(new_root);
++                blockstore.slots_stats.mark_rooted(new_root);
+ 
+-            rpc_subscriptions.notify_roots(rooted_slots);
+-            if let Some(sender) = bank_notification_sender {
+-                sender
+-                    .sender
+-                    .send(BankNotification::NewRootBank(root_bank))
+-                    .unwrap_or_else(|err| warn!("bank_notification_sender failed: {:?}", err));
++                rpc_subscriptions.notify_roots(rooted_slots);
++                if let Some(sender) = bank_notification_sender {
++                    sender
++                        .sender
++                        .send(BankNotification::NewRootBank(root_bank))
++                        .unwrap_or_else(|err| warn!("bank_notification_sender failed: {:?}", err));
+ 
+-                if let Some(new_chain) = rooted_slots_with_parents {
+-                    sender
+-                        .sender
+-                        .send(BankNotification::NewRootedChain(new_chain))
+-                        .unwrap_or_else(|err| warn!("bank_notification_sender failed: {:?}", err));
+-                }
+-            }
+-            info!("new root {}", new_root);
+-        }
++                    if let Some(new_chain) = rooted_slots_with_parents {
++                        sender
++                            .sender
++                            .send(BankNotification::NewRootedChain(new_chain))
++                            .unwrap_or_else(|err| {
++                                warn!("bank_notification_sender failed: {:?}", err)
++                            });
++                    }
++                }
++                info!("new root {}", new_root);
++            }
+ 
+-        let mut update_commitment_cache_time = Measure::start("update_commitment_cache");
+-        // Send (voted) bank along with the updated vote account state for this node, the vote
+-        // state is always newer than the one in the bank by definition, because banks can't
+-        // contain vote transactions which are voting on its own slot.
+-        //
+-        // It should be acceptable to aggressively use the vote for our own _local view_ of
+-        // commitment aggregation, although it's not guaranteed that the new vote transaction is
+-        // observed by other nodes at this point.
+-        //
+-        // The justification stems from the assumption of the sensible voting behavior from the
+-        // consensus subsystem. That's because it means there would be a slashing possibility
+-        // otherwise.
+-        //
+-        // This behavior isn't significant normally for mainnet-beta, because staked nodes aren't
+-        // servicing RPC requests. However, this eliminates artificial 1-slot delay of the
+-        // `finalized` confirmation if a node is materially staked and servicing RPC requests at
+-        // the same time for development purposes.
+-        let node_vote_state = (*vote_account_pubkey, tower.vote_state.clone());
+-        Self::update_commitment_cache(
+-            bank.clone(),
+-            bank_forks.read().unwrap().root(),
+-            progress.get_fork_stats(bank.slot()).unwrap().total_stake,
+-            node_vote_state,
+-            lockouts_sender,
+-        );
+-        update_commitment_cache_time.stop();
+-        replay_timing.update_commitment_cache_us += update_commitment_cache_time.as_us();
++            let mut update_commitment_cache_time = Measure::start("update_commitment_cache");
++            // Send (voted) bank along with the updated vote account state for this node, the vote
++            // state is always newer than the one in the bank by definition, because banks can't
++            // contain vote transactions which are voting on its own slot.
++            //
++            // It should be acceptable to aggressively use the vote for our own _local view_ of
++            // commitment aggregation, although it's not guaranteed that the new vote transaction is
++            // observed by other nodes at this point.
++            //
++            // The justification stems from the assumption of the sensible voting behavior from the
++            // consensus subsystem. That's because it means there would be a slashing possibility
++            // otherwise.
++            //
++            // This behavior isn't significant normally for mainnet-beta, because staked nodes aren't
++            // servicing RPC requests. However, this eliminates artificial 1-slot delay of the
++            // `finalized` confirmation if a node is materially staked and servicing RPC requests at
++            // the same time for development purposes.
++            let node_vote_state = (*vote_account_pubkey, tower.vote_state.clone());
++            Self::update_commitment_cache(
++                bank.clone(),
++                bank_forks.read().unwrap().root(),
++                progress.get_fork_stats(bank.slot()).unwrap().total_stake,
++                node_vote_state,
++                lockouts_sender,
++            );
++            update_commitment_cache_time.stop();
++            replay_timing.update_commitment_cache_us += update_commitment_cache_time.as_us();
++        }
+ 
++        info!("voting for window: {:?}", new_slots);
+         Self::push_vote(
+-            bank,
++            banks.last().unwrap(),
+             vote_account_pubkey,
+             identity_keypair,
+             authorized_voter_keypairs,
+@@ -3831,6 +4102,7 @@
+     #[allow(clippy::too_many_arguments)]
+     fn mark_slots_duplicate_confirmed(
+         confirmed_slots: &[(Slot, Hash)],
++        mostly_confirmed_forks: &[Slot],
+         blockstore: &Blockstore,
+         bank_forks: &RwLock<BankForks>,
+         progress: &mut ProgressMap,
+@@ -3879,25 +4151,34 @@
+                 SlotStateUpdate::DuplicateConfirmed(duplicate_confirmed_state),
+             );
+         }
++        for slot in mostly_confirmed_forks.iter() {
++            progress.set_mostly_confirmed_slot(*slot);
++        }
+     }
+ 
++    /// Returns tuple of (duplicate_confirmed_forks, mostly_confirmed_forks)
+     fn tower_duplicate_confirmed_forks(
+         tower: &Tower,
+         voted_stakes: &VotedStakes,
+         total_stake: Stake,
+         progress: &ProgressMap,
+         bank_forks: &RwLock<BankForks>,
+-    ) -> Vec<(Slot, Hash)> {
++    ) -> (Vec<(Slot, Hash)>, Vec<Slot>) {
+         let mut duplicate_confirmed_forks = vec![];
++        let mut mostly_confirmed_forks = vec![];
++
+         for (slot, prog) in progress.iter() {
++            // Skip if already marked as duplicate confirmed
+             if prog.fork_stats.duplicate_confirmed_hash.is_some() {
+                 continue;
+             }
++
+             let bank = bank_forks
+                 .read()
+                 .unwrap()
+                 .get(*slot)
+                 .expect("bank in progress must exist in BankForks");
++
+             let duration = prog
+                 .replay_stats
+                 .read()
+@@ -3905,18 +4186,21 @@
+                 .started
+                 .elapsed()
+                 .as_millis();
++
+             if !bank.is_frozen() {
+                 continue;
+             }
++
++            // Check for duplicate confirmation
+             if tower.is_slot_duplicate_confirmed(*slot, voted_stakes, total_stake) {
+                 info!(
+-                    "validator fork duplicate confirmed {} {}ms",
+-                    *slot, duration
+-                );
++                "validator fork duplicate confirmed {} {}ms",
++                *slot, duration
++            );
+                 datapoint_info!(
+-                    "validator-duplicate-confirmation",
+-                    ("duration_ms", duration, i64)
+-                );
++                "validator-duplicate-confirmation",
++                ("duration_ms", duration, i64)
++            );
+                 duplicate_confirmed_forks.push((*slot, bank.hash()));
+             } else {
+                 debug!(
+@@ -3926,8 +4210,13 @@
+                     voted_stakes.get(slot)
+                 );
+             }
++
++            // Check for mostly confirmed status
++            if tower.is_slot_mostly_confirmed(*slot, voted_stakes, total_stake) {
++                mostly_confirmed_forks.push(*slot);
++            }
+         }
+-        duplicate_confirmed_forks
++        (duplicate_confirmed_forks, mostly_confirmed_forks)
+     }
+ 
+     #[allow(clippy::too_many_arguments)]
+@@ -5280,7 +5569,7 @@
+         // bank 1, so no slot should be confirmed.
+         {
+             let fork_progress = progress.get(&0).unwrap();
+-            let confirmed_forks = ReplayStage::tower_duplicate_confirmed_forks(
++            let (confirmed_forks, _) = ReplayStage::tower_duplicate_confirmed_forks(
+                 &tower,
+                 &fork_progress.fork_stats.voted_stakes,
+                 fork_progress.fork_stats.total_stake,
+@@ -5330,7 +5619,7 @@
+         assert_eq!(newly_computed, vec![1]);
+         {
+             let fork_progress = progress.get(&1).unwrap();
+-            let confirmed_forks = ReplayStage::tower_duplicate_confirmed_forks(
++            let (confirmed_forks, _) = ReplayStage::tower_duplicate_confirmed_forks(
+                 &tower,
+                 &fork_progress.fork_stats.voted_stakes,
+                 fork_progress.fork_stats.total_stake,
+@@ -6655,7 +6944,7 @@
+         assert_eq!(reset_fork.unwrap(), 4);
+ 
+         // Record the vote for 5 which is not on the heaviest fork.
+-        tower.record_bank_vote(&bank_forks.read().unwrap().get(5).unwrap());
++        tower.record_bank_vote(&bank_forks.read().unwrap().get(5).unwrap(), true);
+ 
+         // 4 should be the heaviest slot, but should not be votable
+         // because of lockout. 5 is the heaviest slot on the same fork as the last vote.
+@@ -6873,7 +7162,7 @@
+         assert_eq!(reset_fork.unwrap(), 4);
+ 
+         // Record the vote for 4
+-        tower.record_bank_vote(&bank_forks.read().unwrap().get(4).unwrap());
++        tower.record_bank_vote(&bank_forks.read().unwrap().get(4).unwrap(), true);
+ 
+         // Mark 4 as duplicate, 3 should be the heaviest slot, but should not be votable
+         // because of lockout
+@@ -7107,7 +7396,7 @@
+             ..
+         } = vote_simulator;
+ 
+-        tower.record_bank_vote(&bank_forks.read().unwrap().get(first_vote).unwrap());
++        tower.record_bank_vote(&bank_forks.read().unwrap().get(first_vote).unwrap(), true);
+ 
+         // Simulate another version of slot 2 was duplicate confirmed
+         let our_bank2_hash = bank_forks.read().unwrap().bank_hash(2).unwrap();
+@@ -7225,6 +7514,7 @@
+             .select_forks(&frozen_banks, &tower, &progress, &ancestors, &bank_forks);
+         assert_eq!(heaviest_bank.slot(), 7);
+         assert!(heaviest_bank_on_same_fork.is_none());
++        let mut junk = 0;
+         select_vote_and_reset_forks(
+             &heaviest_bank,
+             heaviest_bank_on_same_fork.as_ref(),
+@@ -7234,6 +7524,7 @@
+             &mut tower,
+             &latest_validator_votes_for_frozen_banks,
+             &heaviest_subtree_fork_choice,
++            &mut junk,
+         )
+     }
+ 
+@@ -7348,6 +7639,7 @@
+             .select_forks(&frozen_banks, &tower, &progress, &ancestors, &bank_forks);
+         assert_eq!(heaviest_bank.slot(), 5);
+         assert!(heaviest_bank_on_same_fork.is_none());
++        let mut junk = 0;
+         select_vote_and_reset_forks(
+             &heaviest_bank,
+             heaviest_bank_on_same_fork.as_ref(),
+@@ -7357,6 +7649,7 @@
+             &mut tower,
+             &latest_validator_votes_for_frozen_banks,
+             &heaviest_subtree_fork_choice,
++            &mut junk,
+         )
+     }
+ 
+@@ -7504,7 +7797,7 @@
+             1,
+         );
+         bank1.fill_bank_with_ticks_for_tests();
+-        tower.record_bank_vote(&bank0);
++        tower.record_bank_vote(&bank0, true);
+         ReplayStage::push_vote(
+             &bank0,
+             &my_vote_pubkey,
+@@ -7579,7 +7872,7 @@
+ 
+         // Simulate submitting a new vote for bank 1 to the network, but the vote
+         // not landing
+-        tower.record_bank_vote(&bank1);
++        tower.record_bank_vote(&bank1, true);
+         ReplayStage::push_vote(
+             &bank1,
+             &my_vote_pubkey,
+@@ -7777,7 +8070,7 @@
+         progress: &mut ProgressMap,
+     ) -> Arc<Bank> {
+         let my_vote_pubkey = &my_vote_keypair[0].pubkey();
+-        tower.record_bank_vote(&parent_bank);
++        tower.record_bank_vote(&parent_bank, true);
+         ReplayStage::push_vote(
+             &parent_bank,
+             my_vote_pubkey,
+@@ -7981,6 +8274,7 @@
+         assert_eq!(tower.last_voted_slot(), Some(last_voted_slot));
+         assert_eq!(progress.my_latest_landed_vote(tip_of_voted_fork), Some(0));
+         let other_fork_bank = &bank_forks.read().unwrap().get(other_fork_slot).unwrap();
++        let mut junk = 0;
+         let SelectVoteAndResetForkResult { vote_bank, .. } = select_vote_and_reset_forks(
+             other_fork_bank,
+             Some(&new_bank),
+@@ -7990,6 +8284,7 @@
+             &mut tower,
+             &latest_validator_votes_for_frozen_banks,
+             &heaviest_subtree_fork_choice,
++            &mut junk,
+         );
+         assert!(vote_bank.is_some());
+         assert_eq!(vote_bank.unwrap().0.slot(), tip_of_voted_fork);
+@@ -7997,6 +8292,7 @@
+         // If last vote is already equal to heaviest_bank_on_same_voted_fork,
+         // we should not vote.
+         let last_voted_bank = &bank_forks.read().unwrap().get(last_voted_slot).unwrap();
++        let mut junk = 0;
+         let SelectVoteAndResetForkResult { vote_bank, .. } = select_vote_and_reset_forks(
+             other_fork_bank,
+             Some(last_voted_bank),
+@@ -8006,12 +8302,14 @@
+             &mut tower,
+             &latest_validator_votes_for_frozen_banks,
+             &heaviest_subtree_fork_choice,
++            &mut junk,
+         );
+         assert!(vote_bank.is_none());
+ 
+         // If last vote is still inside slot hashes history of heaviest_bank_on_same_voted_fork,
+         // we should not vote.
+         let last_voted_bank_plus_1 = &bank_forks.read().unwrap().get(last_voted_slot + 1).unwrap();
++        let mut junk = 0;
+         let SelectVoteAndResetForkResult { vote_bank, .. } = select_vote_and_reset_forks(
+             other_fork_bank,
+             Some(last_voted_bank_plus_1),
+@@ -8021,6 +8319,7 @@
+             &mut tower,
+             &latest_validator_votes_for_frozen_banks,
+             &heaviest_subtree_fork_choice,
++            &mut junk,
+         );
+         assert!(vote_bank.is_none());
+ 
+@@ -8029,6 +8328,7 @@
+             .entry(new_bank.slot())
+             .and_modify(|s| s.fork_stats.my_latest_landed_vote = Some(last_voted_slot));
+         assert!(!new_bank.is_in_slot_hashes_history(&last_voted_slot));
++        let mut junk = 0;
+         let SelectVoteAndResetForkResult { vote_bank, .. } = select_vote_and_reset_forks(
+             other_fork_bank,
+             Some(&new_bank),
+@@ -8038,6 +8338,7 @@
+             &mut tower,
+             &latest_validator_votes_for_frozen_banks,
+             &heaviest_subtree_fork_choice,
++            &mut junk,
+         );
+         assert!(vote_bank.is_none());
+     }
+@@ -8501,6 +8802,7 @@
+         );
+         let (heaviest_bank, heaviest_bank_on_same_fork) = heaviest_subtree_fork_choice
+             .select_forks(&frozen_banks, tower, progress, ancestors, bank_forks);
++        let mut junk = 0;
+         let SelectVoteAndResetForkResult {
+             vote_bank,
+             reset_bank,
+@@ -8514,6 +8816,7 @@
+             tower,
+             latest_validator_votes_for_frozen_banks,
+             heaviest_subtree_fork_choice,
++            &mut junk,
+         );
+         (
+             vote_bank.map(|(b, _)| b.slot()),
+@@ -9202,6 +9505,7 @@
+ 
+         ReplayStage::mark_slots_duplicate_confirmed(
+             &confirmed_slots,
++            &[],
+             &blockstore,
+             &bank_forks,
+             &mut progress,
+@@ -9227,6 +9531,7 @@
+         let confirmed_slots = [(6, Hash::new_unique())];
+         ReplayStage::mark_slots_duplicate_confirmed(
+             &confirmed_slots,
++            &[],
+             &blockstore,
+             &bank_forks,
+             &mut progress,
+Index: sdk/program/src/vote/state/mod.rs
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/sdk/program/src/vote/state/mod.rs b/sdk/program/src/vote/state/mod.rs
+--- a/sdk/program/src/vote/state/mod.rs	(revision 901f632e0c82982fa314085e538b6b355160e60b)
++++ b/sdk/program/src/vote/state/mod.rs	(date 1737737507959)
+@@ -698,6 +698,7 @@
+         epoch: Epoch,
+         current_slot: Slot,
+         timely_vote_credits: bool,
++        pop_expired: bool,
+     ) {
+         // Ignore votes for slots earlier than we already have votes for
+         if self
+@@ -707,7 +708,9 @@
+             return;
+         }
+ 
+-        self.pop_expired_votes(next_vote_slot);
++        if pop_expired {
++            self.pop_expired_votes(next_vote_slot);
++        }
+ 
+         let landed_vote = LandedVote {
+             latency: if timely_vote_credits {
+Index: core/src/consensus/fork_choice.rs
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/core/src/consensus/fork_choice.rs b/core/src/consensus/fork_choice.rs
+--- a/core/src/consensus/fork_choice.rs	(revision 901f632e0c82982fa314085e538b6b355160e60b)
++++ b/core/src/consensus/fork_choice.rs	(date 1737741289005)
+@@ -322,6 +322,7 @@
+     tower: &Tower,
+     failure_reasons: &mut Vec<HeaviestForkFailures>,
+     switch_fork_decision: &SwitchForkDecision,
++    last_logged_vote_slot: &mut Slot,
+ ) -> bool {
+     let (
+         is_locked_out,
+@@ -390,11 +391,14 @@
+         && propagation_confirmed
+         && switch_fork_decision.can_vote()
+     {
+-        info!(
+-            "voting: {} {:.1}%",
+-            candidate_vote_bank_slot,
+-            100.0 * fork_weight
+-        );
++        if candidate_vote_bank_slot != *last_logged_vote_slot {
++            info!(
++                        "voting: {} {:.1}%",
++                        candidate_vote_bank_slot,
++                        100.0 * fork_weight
++                    );
++            *last_logged_vote_slot = candidate_vote_bank_slot;
++        }
+         true
+     } else {
+         false
+@@ -423,6 +427,7 @@
+     tower: &mut Tower,
+     latest_validator_votes_for_frozen_banks: &LatestValidatorVotesForFrozenBanks,
+     fork_choice: &HeaviestSubtreeForkChoice,
++    last_logged_vote_slot: &mut Slot,
+ ) -> SelectVoteAndResetForkResult {
+     // Try to vote on the actual heaviest fork. If the heaviest bank is
+     // locked out or fails the threshold check, the validator will:
+@@ -479,6 +484,7 @@
+         tower,
+         &mut failure_reasons,
+         &switch_fork_decision,
++        last_logged_vote_slot,
+     ) {
+         // We can vote!
+         SelectVoteAndResetForkResult {
+Index: programs/vote/src/vote_state/mod.rs
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/programs/vote/src/vote_state/mod.rs b/programs/vote/src/vote_state/mod.rs
+--- a/programs/vote/src/vote_state/mod.rs	(revision 901f632e0c82982fa314085e538b6b355160e60b)
++++ b/programs/vote/src/vote_state/mod.rs	(date 1737738016179)
+@@ -749,10 +749,17 @@
+     epoch: Epoch,
+     current_slot: Slot,
+     timely_vote_credits: bool,
++    pop_expired: bool,
+ ) -> Result<(), VoteError> {
+     check_slots_are_valid(vote_state, vote_slots, &vote.hash, slot_hashes)?;
+     vote_slots.iter().for_each(|s| {
+-        vote_state.process_next_vote_slot(*s, epoch, current_slot, timely_vote_credits)
++        vote_state.process_next_vote_slot(
++            *s,
++            epoch,
++            current_slot,
++            timely_vote_credits,
++            pop_expired,
++        )
+     });
+     Ok(())
+ }
+@@ -764,6 +771,7 @@
+     epoch: Epoch,
+     current_slot: Slot,
+     timely_vote_credits: bool,
++    pop_expired: bool,
+ ) -> Result<(), VoteError> {
+     if vote.slots.is_empty() {
+         return Err(VoteError::EmptySlots);
+@@ -786,11 +794,16 @@
+         epoch,
+         current_slot,
+         timely_vote_credits,
++        pop_expired,
+     )
+ }
+ 
+ /// "unchecked" functions used by tests and Tower
+-pub fn process_vote_unchecked(vote_state: &mut VoteState, vote: Vote) -> Result<(), VoteError> {
++pub fn process_vote_unchecked(
++    vote_state: &mut VoteState,
++    vote: Vote,
++    pop_expired: bool,
++) -> Result<(), VoteError> {
+     if vote.slots.is_empty() {
+         return Err(VoteError::EmptySlots);
+     }
+@@ -803,6 +816,7 @@
+         vote_state.current_epoch(),
+         0,
+         true,
++        pop_expired,
+     )
+ }
+ 
+@@ -814,7 +828,7 @@
+ }
+ 
+ pub fn process_slot_vote_unchecked(vote_state: &mut VoteState, slot: Slot) {
+-    let _ = process_vote_unchecked(vote_state, Vote::new(vec![slot], Hash::default()));
++    let _ = process_vote_unchecked(vote_state, Vote::new(vec![slot], Hash::default()), true);
+ }
+ 
+ /// Authorize the given pubkey to withdraw or sign votes. This may be called multiple times,
+@@ -1083,6 +1097,7 @@
+         clock.epoch,
+         clock.slot,
+         timely_vote_credits,
++        true,
+     )?;
+     if let Some(timestamp) = vote.timestamp {
+         vote.slots
+@@ -1320,7 +1335,7 @@
+             134, 135,
+         ]
+         .into_iter()
+-        .for_each(|v| vote_state.process_next_vote_slot(v, 4, 0, false));
++        .for_each(|v| vote_state.process_next_vote_slot(v, 4, 0, false, true));
+ 
+         let version1_14_11_serialized = bincode::serialize(&VoteStateVersions::V1_14_11(Box::new(
+             VoteState1_14_11::from(vote_state.clone()),
+@@ -1801,11 +1816,11 @@
+         let slot_hashes: Vec<_> = vote.slots.iter().rev().map(|x| (*x, vote.hash)).collect();
+ 
+         assert_eq!(
+-            process_vote(&mut vote_state_a, &vote, &slot_hashes, 0, 0, true),
++            process_vote(&mut vote_state_a, &vote, &slot_hashes, 0, 0, true, true),
+             Ok(())
+         );
+         assert_eq!(
+-            process_vote(&mut vote_state_b, &vote, &slot_hashes, 0, 0, true),
++            process_vote(&mut vote_state_b, &vote, &slot_hashes, 0, 0, true, true),
+             Ok(())
+         );
+         assert_eq!(recent_votes(&vote_state_a), recent_votes(&vote_state_b));
+@@ -1818,12 +1833,12 @@
+         let vote = Vote::new(vec![0], Hash::default());
+         let slot_hashes: Vec<_> = vec![(0, vote.hash)];
+         assert_eq!(
+-            process_vote(&mut vote_state, &vote, &slot_hashes, 0, 0, true),
++            process_vote(&mut vote_state, &vote, &slot_hashes, 0, 0, true, true),
+             Ok(())
+         );
+         let recent = recent_votes(&vote_state);
+         assert_eq!(
+-            process_vote(&mut vote_state, &vote, &slot_hashes, 0, 0, true),
++            process_vote(&mut vote_state, &vote, &slot_hashes, 0, 0, true, true),
+             Err(VoteError::VoteTooOld)
+         );
+         assert_eq!(recent, recent_votes(&vote_state));
+@@ -1883,7 +1898,7 @@
+         let vote = Vote::new(vec![0], Hash::default());
+         let slot_hashes: Vec<_> = vec![(*vote.slots.last().unwrap(), vote.hash)];
+         assert_eq!(
+-            process_vote(&mut vote_state, &vote, &slot_hashes, 0, 0, true),
++            process_vote(&mut vote_state, &vote, &slot_hashes, 0, 0, true, true),
+             Ok(())
+         );
+         assert_eq!(
+@@ -1899,7 +1914,7 @@
+         let vote = Vote::new(vec![0], Hash::default());
+         let slot_hashes: Vec<_> = vec![(*vote.slots.last().unwrap(), vote.hash)];
+         assert_eq!(
+-            process_vote(&mut vote_state, &vote, &slot_hashes, 0, 0, true),
++            process_vote(&mut vote_state, &vote, &slot_hashes, 0, 0, true, true),
+             Ok(())
+         );
+ 
+@@ -1918,7 +1933,7 @@
+         let vote = Vote::new(vec![0], Hash::default());
+         let slot_hashes: Vec<_> = vec![(*vote.slots.last().unwrap(), vote.hash)];
+         assert_eq!(
+-            process_vote(&mut vote_state, &vote, &slot_hashes, 0, 0, true),
++            process_vote(&mut vote_state, &vote, &slot_hashes, 0, 0, true, true),
+             Ok(())
+         );
+ 
+@@ -1935,7 +1950,7 @@
+ 
+         let vote = Vote::new(vec![], Hash::default());
+         assert_eq!(
+-            process_vote(&mut vote_state, &vote, &[], 0, 0, true),
++            process_vote(&mut vote_state, &vote, &[], 0, 0, true, true),
+             Err(VoteError::EmptySlots)
+         );
+     }
+@@ -2016,6 +2031,7 @@
+                     hash: Hash::new_unique(),
+                     timestamp: None,
+                 },
++                true,
+             )
+             .unwrap();
+ 
+@@ -3116,7 +3132,7 @@
+         // error with `VotesTooOldAllFiltered`
+         let slot_hashes = vec![(3, Hash::new_unique()), (2, Hash::new_unique())];
+         assert_eq!(
+-            process_vote(&mut vote_state, &vote, &slot_hashes, 0, 0, true),
++            process_vote(&mut vote_state, &vote, &slot_hashes, 0, 0, true, true),
+             Err(VoteError::VotesTooOldAllFiltered)
+         );
+ 
+@@ -3130,7 +3146,7 @@
+             .1;
+ 
+         let vote = Vote::new(vec![old_vote_slot, vote_slot], vote_slot_hash);
+-        process_vote(&mut vote_state, &vote, &slot_hashes, 0, 0, true).unwrap();
++        process_vote(&mut vote_state, &vote, &slot_hashes, 0, 0, true, true).unwrap();
+         assert_eq!(
+             vote_state
+                 .votes
+@@ -3159,8 +3175,17 @@
+                 .unwrap()
+                 .1;
+             let vote = Vote::new(vote_slots, vote_hash);
+-            process_vote_unfiltered(&mut vote_state, &vote.slots, &vote, slot_hashes, 0, 0, true)
+-                .unwrap();
++            process_vote_unfiltered(
++                &mut vote_state,
++                &vote.slots,
++                &vote,
++                slot_hashes,
++                0,
++                0,
++                true,
++                true,
++            )
++            .unwrap();
+         }
+ 
+         vote_state

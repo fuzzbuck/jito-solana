@@ -15,7 +15,7 @@ use {
 /// For each instruction it calls the program entrypoint method and verifies that the result of
 /// the call does not violate the bank's accounting rules.
 /// The accounts are committed back to the bank only if every instruction succeeds.
-pub(crate) fn process_message(
+pub fn process_message(
     message: &impl SVMMessage,
     program_indices: &[Vec<IndexOfAccount>],
     invoke_context: &mut InvokeContext,

@@ -8,12 +8,12 @@ use {
 };
 
 #[derive(PartialEq, Debug)]
-pub(crate) struct TransactionAccountStateInfo {
+pub struct TransactionAccountStateInfo {
     rent_state: Option<RentState>, // None: readonly account
 }
 
 impl TransactionAccountStateInfo {
-    pub(crate) fn new(
+    pub fn new(
         transaction_context: &TransactionContext,
         message: &impl SVMMessage,
         rent_collector: &dyn SVMRentCollector,
@@ -47,7 +47,7 @@ impl TransactionAccountStateInfo {
             .collect()
     }
 
-    pub(crate) fn verify_changes(
+    pub fn verify_changes(
         pre_state_infos: &[Self],
         post_state_infos: &[Self],
         transaction_context: &TransactionContext,

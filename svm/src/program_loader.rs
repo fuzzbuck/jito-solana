@@ -19,7 +19,7 @@ use {
 };
 
 #[derive(Debug)]
-pub(crate) enum ProgramAccountLoadResult {
+pub enum ProgramAccountLoadResult {
     InvalidAccountData(ProgramCacheEntryOwner),
     ProgramOfLoaderV1(AccountSharedData),
     ProgramOfLoaderV2(AccountSharedData),
@@ -27,7 +27,7 @@ pub(crate) enum ProgramAccountLoadResult {
     ProgramOfLoaderV4(AccountSharedData, Slot),
 }
 
-pub(crate) fn load_program_from_bytes(
+pub fn load_program_from_bytes(
     load_program_metrics: &mut LoadProgramMetrics,
     programdata: &[u8],
     loader_key: &Pubkey,
@@ -62,7 +62,7 @@ pub(crate) fn load_program_from_bytes(
     }
 }
 
-pub(crate) fn load_program_accounts<CB: TransactionProcessingCallback>(
+pub fn load_program_accounts<CB: TransactionProcessingCallback>(
     callbacks: &CB,
     pubkey: &Pubkey,
 ) -> Option<ProgramAccountLoadResult> {
@@ -119,7 +119,7 @@ pub(crate) fn load_program_accounts<CB: TransactionProcessingCallback>(
 /// account (belong to one of the program loaders). Returns `Some(InvalidAccountData)` if the program
 /// account is `Closed`, contains invalid data or any of the programdata accounts are invalid.
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
-pub(crate) fn load_program_with_pubkey<CB: TransactionProcessingCallback>(
+pub fn load_program_with_pubkey<CB: TransactionProcessingCallback>(
     callbacks: &CB,
     environments: &ProgramRuntimeEnvironments,
     pubkey: &Pubkey,
@@ -216,7 +216,7 @@ pub(crate) fn load_program_with_pubkey<CB: TransactionProcessingCallback>(
 /// Returns slot 0 for programs deployed with v1/v2 loaders, since programs deployed
 /// with those loaders do not retain deployment slot information.
 /// Returns an error if the program's account state can not be found or parsed.
-pub(crate) fn get_program_modification_slot<CB: TransactionProcessingCallback>(
+pub fn get_program_modification_slot<CB: TransactionProcessingCallback>(
     callbacks: &CB,
     pubkey: &Pubkey,
 ) -> TransactionResult<Slot> {
@@ -278,8 +278,8 @@ mod tests {
     }
 
     #[derive(Default, Clone)]
-    pub(crate) struct MockBankCallback {
-        pub(crate) account_shared_data: RefCell<HashMap<Pubkey, AccountSharedData>>,
+    pub struct MockBankCallback {
+        pub account_shared_data: RefCell<HashMap<Pubkey, AccountSharedData>>,
     }
 
     impl TransactionProcessingCallback for MockBankCallback {

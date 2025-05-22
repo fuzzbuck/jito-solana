@@ -31,7 +31,7 @@ impl Default for RollbackAccounts {
 }
 
 impl RollbackAccounts {
-    pub(crate) fn new(
+    pub fn new(
         nonce: Option<NonceInfo>,
         fee_payer_address: Pubkey,
         mut fee_payer_account: AccountSharedData,

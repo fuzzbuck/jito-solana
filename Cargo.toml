@@ -658,3 +658,4 @@ solana-curve25519 = { path = "curves/curve25519" }
 solana-zk-sdk = { path = "zk-sdk" }
 solana-message = { git = "https://github.com/fuzzbuck/solana-sdk.git", branch = "sdk@v2.2.1-opensvm", features = ["serde"] }
 solana-transaction-status = { path = "transaction-status" }
+solana-transaction = { git = "https://github.com/fuzzbuck/solana-sdk.git", branch = "sdk@v2.2.1-opensvm", features = ["serde"] }

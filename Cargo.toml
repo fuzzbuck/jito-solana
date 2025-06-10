@@ -535,11 +535,11 @@ solana-sysvar = "=2.2.1"
 solana-sysvar-id = "=2.2.1"
 solana-test-validator = { path = "test-validator", version = "=2.2.1" }
 solana-thin-client = { path = "thin-client", version = "=2.2.1" }
-solana-transaction = "=2.2.1"
-solana-transaction-error = "=2.2.1"
+solana-transaction = { git = "https://github.com/fuzzbuck/solana-sdk.git", branch = "sdk@v2.2.1-opensvm" }
+solana-transaction-error = { git = "https://github.com/fuzzbuck/solana-sdk.git", branch = "sdk@v2.2.1-opensvm" }
 solana-tpu-client = { path = "tpu-client", version = "=2.2.1", default-features = false }
 solana-tpu-client-next = { path = "tpu-client-next", version = "=2.2.1" }
-solana-transaction-context = "=2.2.1"
+solana-transaction-context = { git = "https://github.com/fuzzbuck/solana-sdk.git", branch = "sdk@v2.2.1-opensvm" }
 solana-transaction-status = { path = "transaction-status", version = "=2.2.1" }
 solana-transaction-status-client-types = { path = "transaction-status-client-types", version = "=2.2.1" }
 solana-transaction-metrics-tracker = { path = "transaction-metrics-tracker", version = "=2.2.1" }

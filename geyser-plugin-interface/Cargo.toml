@@ -13,9 +13,15 @@ edition = { workspace = true }
 log = { workspace = true, features = ["std"] }
 solana-clock = { workspace = true }
 solana-signature = { workspace = true }
-solana-transaction = { workspace = true }
-solana-transaction-status = { workspace = true }
+
+# solana-transaction = { workspace = true }
+solana-transaction = { git = "https://github.com/fuzzbuck/solana-sdk.git", branch = "sdk@v2.2.1-opensvm", features = ["serde"] }
+
+# solana-transaction-status = { workspace = true }
+solana-transaction-status  = { workspace = true }
+
 thiserror = { workspace = true }
+
 
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]

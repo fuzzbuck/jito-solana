@@ -31,9 +31,9 @@ solana-pubkey = { workspace = true }
 solana-reserved-account-keys = { workspace = true }
 solana-reward-info = { workspace = true }
 solana-sdk-ids = { workspace = true }
-solana-signature = { workspace = true }
+solana-signature = { workspace = true, features = ["serde"] }
 solana-system-interface = { workspace = true }
-solana-transaction = { workspace = true }
+solana-transaction = { workspace = true, features = ["serde"] }
 solana-transaction-error = { workspace = true }
 solana-transaction-status-client-types = { workspace = true }
 spl-associated-token-account = { workspace = true, features = ["no-entrypoint"] }

@@ -3,6 +3,7 @@ mod source_buffer;
 mod target_builtin;
 mod target_core_bpf;
 
+use std::sync::Arc;
 use {
     crate::bank::Bank,
     error::CoreBpfMigrationError,
@@ -169,7 +170,7 @@ impl Bank {
                     0,
                     &MockCallback {},
                     &feature_set,
-                    &sysvar_cache,
+                    Arc::new(sysvar_cache),
                 ),
                 None,
                 compute_budget.to_budget(),

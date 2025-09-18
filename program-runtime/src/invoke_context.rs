@@ -146,7 +146,7 @@ pub struct EnvironmentConfig<'a> {
     pub blockhash_lamports_per_signature: u64,
     epoch_stake_callback: &'a dyn InvokeContextCallback,
     feature_set: &'a SVMFeatureSet,
-    sysvar_cache: &'a SysvarCache,
+    sysvar_cache: Arc<SysvarCache>,
 }
 impl<'a> EnvironmentConfig<'a> {
     pub fn new(
@@ -154,7 +154,7 @@ impl<'a> EnvironmentConfig<'a> {
         blockhash_lamports_per_signature: u64,
         epoch_stake_callback: &'a dyn InvokeContextCallback,
         feature_set: &'a SVMFeatureSet,
-        sysvar_cache: &'a SysvarCache,
+        sysvar_cache: Arc<SysvarCache>,
     ) -> Self {
         Self {
             blockhash,
@@ -659,7 +659,7 @@ impl<'a> InvokeContext<'a> {
 
     /// Get cached sysvars
     pub fn get_sysvar_cache(&self) -> &SysvarCache {
-        self.environment_config.sysvar_cache
+        self.environment_config.sysvar_cache.as_ref()
     }
 
     /// Get cached epoch total stake.
@@ -783,7 +783,7 @@ macro_rules! with_mock_invoke_context_with_feature_set {
             0,
             &MockInvokeContextCallback {},
             $feature_set,
-            &sysvar_cache,
+            Arc::new(sysvar_cache),
         );
         let mut program_cache_for_tx_batch = ProgramCacheForTxBatch::default();
         let mut $invoke_context = InvokeContext::new(

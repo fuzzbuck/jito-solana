@@ -876,7 +876,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
         };
 
         let mut executed_units = 0u64;
-        let sysvar_cache = &self.sysvar_cache.read().unwrap();
+        let sysvar_cache = self.sysvar_cache.read().unwrap().to_owned();
 
         let mut invoke_context = InvokeContext::new(
             &mut transaction_context,
@@ -886,7 +886,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                 environment.blockhash_lamports_per_signature,
                 callback,
                 &environment.feature_set,
-                sysvar_cache,
+                Arc::new(sysvar_cache),
             ),
             log_collector.clone(),
             compute_budget,

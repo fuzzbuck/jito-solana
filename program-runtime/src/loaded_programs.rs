@@ -664,7 +664,7 @@ impl<FG: ForkGraph> Debug for ProgramCache<FG> {
 pub struct ProgramCacheForTxBatch {
     /// Pubkey is the address of a program.
     /// ProgramCacheEntry is the corresponding program entry valid for the slot in which a transaction is being executed.
-    entries: HashMap<Pubkey, Arc<ProgramCacheEntry>>,
+    entries: papaya::HashMap<Pubkey, Arc<ProgramCacheEntry>>,
     /// Program entries modified during the transaction batch.
     modified_entries: HashMap<Pubkey, Arc<ProgramCacheEntry>>,
     slot: Slot,
@@ -692,7 +692,7 @@ impl ProgramCacheForTxBatch {
         latest_root_epoch: Epoch,
     ) -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: papaya::HashMap::new(),
             modified_entries: HashMap::new(),
             slot,
             environments,
@@ -710,7 +710,7 @@ impl ProgramCacheForTxBatch {
         cache: &ProgramCache<FG>,
     ) -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: papaya::HashMap::new(),
             modified_entries: HashMap::new(),
             slot,
             environments: cache.get_environments_for_epoch(epoch),
@@ -742,7 +742,7 @@ impl ProgramCacheForTxBatch {
         key: Pubkey,
         entry: Arc<ProgramCacheEntry>,
     ) -> (bool, Arc<ProgramCacheEntry>) {
-        (self.entries.insert(key, entry.clone()).is_some(), entry)
+        (self.entries.pin().insert(key, entry.clone()).is_some(), entry)
     }
 
     /// Store an entry in `modified_entries` for a program modified during the
@@ -763,7 +763,7 @@ impl ProgramCacheForTxBatch {
         // programs that are loaded for the transaction batch.
         self.modified_entries
             .get(key)
-            .or(self.entries.get(key))
+            .or(self.entries.pin().get(key))
             .map(|entry| {
                 if entry.is_implicit_delay_visibility_tombstone(self.slot) {
                     // Found a program entry on the current fork, but it's not effective
@@ -1115,6 +1115,7 @@ impl<FG: ForkGraph> ProgramCache<FG> {
                                     .fetch_add(*usage_count, Ordering::Relaxed);
                                 loaded_programs_for_tx_batch
                                     .entries
+                                    .pin()
                                     .insert(*key, entry_to_return);
                                 return false;
                             }
@@ -2202,6 +2203,7 @@ mod tests {
         assert_eq!(extracted.slot, working_slot);
         extracted
             .entries
+            .pin()
             .get(program)
             .map(|entry| entry.deployment_slot == deployment_slot)
             .unwrap_or(false)

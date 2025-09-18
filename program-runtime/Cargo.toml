@@ -65,6 +65,7 @@ solana-timings = { workspace = true }
 solana-transaction-context = { workspace = true }
 solana-type-overrides = { workspace = true }
 thiserror = { workspace = true }
+papaya = "0.2.3"
 
 [dev-dependencies]
 assert_matches = { workspace = true }

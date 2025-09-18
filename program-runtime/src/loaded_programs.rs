@@ -738,7 +738,7 @@ impl ProgramCacheForTxBatch {
     /// `true` if an entry existed.
     /// The function also returns the newly inserted value.
     pub fn replenish(
-        &mut self,
+        &self,
         key: Pubkey,
         entry: Arc<ProgramCacheEntry>,
     ) -> (bool, Arc<ProgramCacheEntry>) {
